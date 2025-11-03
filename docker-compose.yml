@@ -6,6 +6,15 @@ services:
       - "${BACKEND_PORT:-8000}:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      - SYMBOL=${SYMBOL:-BTCUSDT}
+      - DEPTH_INTERVAL_MS=${DEPTH_INTERVAL_MS:-100}
+      - MAX_QUEUE=${MAX_QUEUE:-5000}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - BINANCE_WS_BASE_URL=${BINANCE_WS_BASE_URL:-wss://fstream.binance.com/ws}
+      - BINANCE_REST_BASE_URL=${BINANCE_REST_BASE_URL:-https://fapi.binance.com}
+      - DEPTH_SNAPSHOT_LIMIT=${DEPTH_SNAPSHOT_LIMIT:-500}
+      - METRICS_WINDOW_SEC=${METRICS_WINDOW_SEC:-60}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:3000}
     volumes:
       - ./backend:/app
     healthcheck:
