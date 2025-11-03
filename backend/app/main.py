@@ -1,10 +1,21 @@
+import logging
 import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.ws.models import get_settings
+from app.ws.routes import get_ws_module, router as ws_router
+
 load_dotenv()
+
+settings = get_settings()
+
+logging.basicConfig(
+    level=getattr(logging, settings.log_level, logging.INFO),
+    format="%(message)s",
+)
 
 app = FastAPI(title="Botcrypto4 Backend")
 
@@ -21,6 +32,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(ws_router)
+
+ws_module = get_ws_module()
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    await ws_module.startup()
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    await ws_module.shutdown()
 
 
 @app.get("/health")
