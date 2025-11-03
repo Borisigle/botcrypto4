@@ -1,0 +1,85 @@
+:root {
+  color-scheme: dark;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background-color: #020617;
+  color: #f8fafc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #0f172a, #020617);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.page {
+  width: min(640px, 90vw);
+  padding: 3rem;
+  border-radius: 1.5rem;
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  box-shadow: 0 20px 60px rgba(2, 6, 23, 0.6);
+  display: grid;
+  gap: 2rem;
+}
+
+.page__header h1 {
+  margin: 0;
+  font-size: clamp(2.5rem, 5vw, 3rem);
+}
+
+.page__header p {
+  margin-top: 0.75rem;
+  color: #94a3b8;
+}
+
+.card {
+  padding: 2rem;
+  border-radius: 1rem;
+  background: rgba(30, 41, 59, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.card h2 {
+  margin: 0 0 1rem;
+  font-size: 1.5rem;
+}
+
+.card__status {
+  margin: 0;
+  font-size: 1.125rem;
+}
+
+.card__message {
+  margin-top: 0.75rem;
+  color: #cbd5f5;
+  font-size: 0.95rem;
+}
+
+.status-ok {
+  color: #34d399;
+  font-weight: 600;
+}
+
+.status-error {
+  color: #f87171;
+  font-weight: 600;
+}
+
+.page__footer {
+  font-size: 0.8rem;
+  color: #94a3b8;
+  word-break: break-all;
+}
+
+code {
+  background: rgba(15, 23, 42, 0.7);
+  padding: 0.15rem 0.4rem;
+  border-radius: 0.4rem;
+}
