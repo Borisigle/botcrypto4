@@ -18,3 +18,9 @@ async def context_view() -> dict:
 async def levels_view() -> dict:
     service = get_context_service()
     return service.levels_payload()
+
+
+@router.get("/price")
+async def price_view() -> dict:
+    service = get_context_service()
+    return service.price_payload()

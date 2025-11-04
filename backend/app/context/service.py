@@ -50,6 +50,8 @@ class ContextService:
         self.total_volume: float = 0.0
         self.or_high: Optional[float] = None
         self.or_low: Optional[float] = None
+        self.last_trade_price: Optional[float] = None
+        self.last_trade_ts: Optional[datetime] = None
 
     async def startup(self) -> None:
         if self._started:
@@ -81,6 +83,9 @@ class ContextService:
         qty = float(trade.qty)
         if qty <= 0:
             return
+
+        self.last_trade_price = price
+        self.last_trade_ts = trade_ts
 
         self.total_volume += qty
         self.vwap_numerator += price * qty
@@ -115,7 +120,19 @@ class ContextService:
             "session": self._session_state(now),
             "levels": self.levels_payload(),
             "stats": self.stats_payload(),
+            "price": self.price_payload(),
         }
+
+    def price_payload(self) -> Dict[str, Any]:
+        ts_iso = self.last_trade_ts.isoformat() if self.last_trade_ts else None
+        payload: Dict[str, Any] = {
+            "price": self.last_trade_price,
+            "ts": ts_iso,
+        }
+        symbol = getattr(self.settings, "symbol", None)
+        if symbol:
+            payload["symbol"] = symbol
+        return payload
 
     def levels_payload(self) -> Dict[str, Any]:
         or_start_iso = self.or_start.isoformat() if self.or_start else None
@@ -184,6 +201,8 @@ class ContextService:
         self.total_volume = 0.0
         self.or_high = None
         self.or_low = None
+        self.last_trade_price = None
+        self.last_trade_ts = None
 
     def _current_vwap(self) -> Optional[float]:
         if self.vwap_denominator <= 0:
