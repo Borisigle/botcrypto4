@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.context.routes import router as context_router
+from app.context.service import get_context_service
 from app.ws.models import get_settings
 from app.ws.routes import get_ws_module, router as ws_router
 
@@ -33,19 +35,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(context_router)
 app.include_router(ws_router)
 
+context_service = get_context_service()
 ws_module = get_ws_module()
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    await context_service.startup()
     await ws_module.startup()
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     await ws_module.shutdown()
+    await context_service.shutdown()
 
 
 @app.get("/health")

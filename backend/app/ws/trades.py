@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from .client import BaseStreamService, structured_log
 from .metrics import MetricsRecorder
 from .models import Settings, TradeSide, TradeTick
+
+if TYPE_CHECKING:
+    from app.context.service import ContextService
 
 
 def parse_trade_message(message: Dict[str, Any]) -> TradeTick:
@@ -36,9 +39,15 @@ def parse_trade_message(message: Dict[str, Any]) -> TradeTick:
 class TradeStream(BaseStreamService):
     """Background service ingesting aggregated trades."""
 
-    def __init__(self, settings: Settings, metrics: MetricsRecorder) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        metrics: MetricsRecorder,
+        context_service: Optional["ContextService"] = None,
+    ) -> None:
         super().__init__("trades", settings.trades_ws_url or "", settings)
         self.metrics = metrics
+        self.context_service = context_service
 
     async def handle_payload(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -59,6 +68,8 @@ class TradeStream(BaseStreamService):
 
         self.state.last_ts = tick.ts
         self.metrics.record_trade()
+        if self.context_service:
+            self.context_service.ingest_trade(tick)
         lag_ms = (datetime.now(timezone.utc) - tick.ts).total_seconds() * 1000
         structured_log(
             self.logger,

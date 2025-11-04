@@ -7,6 +7,8 @@ from typing import Any, Dict
 
 from fastapi import APIRouter
 
+from app.context.service import get_context_service
+
 from .depth import DepthStream
 from .metrics import MetricsRecorder
 from .models import MetricsSnapshot, StreamHealth, get_settings
@@ -22,7 +24,12 @@ class WSModule:
         self.settings = get_settings()
         logging.getLogger().setLevel(self.settings.log_level)
         self.metrics = MetricsRecorder(self.settings.metrics_window_sec)
-        self.trade_stream = TradeStream(self.settings, self.metrics)
+        self.context_service = get_context_service()
+        self.trade_stream = TradeStream(
+            self.settings,
+            self.metrics,
+            context_service=self.context_service,
+        )
         self.depth_stream = DepthStream(self.settings, self.metrics)
 
     async def startup(self) -> None:

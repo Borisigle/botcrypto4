@@ -11,6 +11,11 @@ from typing import Optional
 from pydantic import BaseModel
 
 
+def _env_bool(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class TradeSide(str, Enum):
     """Normalized aggressor side for trades."""
 
@@ -75,6 +80,15 @@ class Settings:
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     metrics_window_sec: int = field(
         default_factory=lambda: int(os.getenv("METRICS_WINDOW_SEC", "60"))
+    )
+    context_history_dir: str = field(
+        default_factory=lambda: os.getenv("CONTEXT_HISTORY_DIR", "./data/history")
+    )
+    context_bootstrap_prev_day: bool = field(
+        default_factory=lambda: _env_bool("CONTEXT_BOOTSTRAP_PREV_DAY", "true")
+    )
+    context_fetch_missing_history: bool = field(
+        default_factory=lambda: _env_bool("CONTEXT_FETCH_MISSING_HISTORY", "false")
     )
 
     def __post_init__(self) -> None:
