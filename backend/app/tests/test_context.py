@@ -150,3 +150,32 @@ async def test_poc_computation_with_synthetic_profile() -> None:
     assert service.levels_payload()["POCd"] == pytest.approx(98)
 
     await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_price_payload_tracks_last_trade() -> None:
+    now = [datetime(2024, 3, 3, 14, tzinfo=timezone.utc)]
+    settings = Settings(context_bootstrap_prev_day=False)
+    service = ContextService(settings=settings, now_provider=lambda: now[0])
+    await service.startup()
+
+    empty_payload = service.price_payload()
+    assert empty_payload["price"] is None
+    assert empty_payload["ts"] is None
+    assert empty_payload["symbol"] == settings.symbol
+
+    trade = _make_trade(
+        datetime(2024, 3, 3, 14, 5, tzinfo=timezone.utc),
+        45000.5,
+        0.75,
+        TradeSide.BUY,
+        42,
+    )
+    service.ingest_trade(trade)
+
+    price_payload = service.price_payload()
+    assert price_payload["price"] == pytest.approx(45000.5)
+    assert price_payload["ts"] == trade.ts.isoformat()
+    assert price_payload["symbol"] == settings.symbol
+
+    await service.shutdown()
