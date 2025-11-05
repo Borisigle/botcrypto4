@@ -90,6 +90,9 @@ class Settings:
     context_fetch_missing_history: bool = field(
         default_factory=lambda: _env_bool("CONTEXT_FETCH_MISSING_HISTORY", "false")
     )
+    context_backfill_enabled: bool = field(
+        default_factory=lambda: _env_bool("CONTEXT_BACKFILL_ENABLED", "true")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")

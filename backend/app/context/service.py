@@ -9,12 +9,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR, getcontext
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import httpx
 import polars as pl
 
 from app.ws.models import Settings, TradeSide, TradeTick, get_settings
+
+from .backfill import BinanceTradeHistory, TradeHistoryProvider
 
 logger = logging.getLogger("context")
 
@@ -41,11 +43,13 @@ class ContextService:
         settings: Optional[Settings] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         exchange_info: Optional[SymbolExchangeInfo] = None,
+        history_provider: Optional[TradeHistoryProvider] = None,
         fetch_exchange_info: bool = True,
     ) -> None:
         self.settings = settings or get_settings()
         self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self._fetch_exchange_info_enabled = fetch_exchange_info
+        self._history_provider: Optional[TradeHistoryProvider] = history_provider
 
         self._started = False
         self._periodic_task: Optional[asyncio.Task[None]] = None
@@ -105,9 +109,21 @@ class ContextService:
         elif self.exchange_info is None:
             logger.warning("exchange_info_unavailable symbol=%s", self.settings.symbol)
 
-        today = self._now_provider().date()
+        now = self._now_provider()
+        today = now.date()
         self._roll_day(today)
-        if self.settings.context_bootstrap_prev_day:
+
+        prev_levels_loaded = False
+        if self.settings.context_backfill_enabled:
+            try:
+                prev_levels_loaded = await self._perform_backfill(now)
+            except Exception as exc:  # pragma: no cover - diagnostic logging
+                logger.exception(
+                    "context_backfill_failed",
+                    extra={"error": str(exc)},
+                )
+
+        if not prev_levels_loaded and self.settings.context_bootstrap_prev_day:
             prev_day = today - timedelta(days=1)
             levels = self._load_previous_day(prev_day)
             if levels:
@@ -389,6 +405,161 @@ class ContextService:
                 day_low = price
 
         return self._profile_from_volume(volume_map, day_high, day_low)
+
+    def _get_history_provider(self) -> Optional[TradeHistoryProvider]:
+        if self._history_provider is None:
+            self._history_provider = BinanceTradeHistory(self.settings)
+        return self._history_provider
+
+    async def _perform_backfill(self, now: datetime) -> bool:
+        provider = self._get_history_provider()
+        if provider is None or not self.day_start:
+            return False
+
+        prev_levels_loaded = False
+        day_start = self.day_start
+
+        if now > day_start:
+            start_iso = day_start.isoformat()
+            end_iso = now.isoformat()
+            logger.info(
+                "Backfill: downloading trades from %s to %s",
+                start_iso,
+                end_iso,
+            )
+            try:
+                trade_count = await self._ingest_historical_trades(provider, day_start, now)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "backfill_today_failed",
+                    extra={"error": str(exc), "start": start_iso, "end": end_iso},
+                )
+            else:
+                vwap_value = self._current_vwap("base")
+                range_today = (
+                    self.day_high - self.day_low
+                    if self.day_high is not None and self.day_low is not None
+                    else None
+                )
+                logger.info(
+                    "Backfill complete: trades=%d VWAP=%s POC=%s rangeToday=%s cd_pre=%s",
+                    trade_count,
+                    self._format_float(vwap_value),
+                    self._format_float(self.poc_price),
+                    self._format_float(range_today),
+                    self._format_float(self.pre_market_delta),
+                )
+        else:
+            logger.info("Backfill: startup at 00:00 UTC; skipping intraday history")
+
+        try:
+            prev_levels_loaded = await self._populate_previous_day(provider, day_start)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception(
+                "backfill_previous_day_failed",
+                extra={"error": str(exc)},
+            )
+            prev_levels_loaded = False
+
+        return prev_levels_loaded
+
+    async def _ingest_historical_trades(
+        self,
+        provider: TradeHistoryProvider,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        trade_count = 0
+        progress_step = 50000
+        async for trade in provider.iterate_trades(start, end):
+            self.ingest_trade(trade)
+            trade_count += 1
+            if trade_count % progress_step == 0:
+                logger.info(
+                    "Backfill progress: trades=%d last_ts=%s",
+                    trade_count,
+                    trade.ts.isoformat(),
+                )
+        return trade_count
+
+    async def _populate_previous_day(
+        self,
+        provider: TradeHistoryProvider,
+        day_start: datetime,
+    ) -> bool:
+        prev_start = day_start - timedelta(days=1)
+        prev_end = day_start - timedelta(milliseconds=1)
+        if prev_end < prev_start:
+            return False
+
+        logger.info(
+            "Backfill: loading previous day from %s to %s",
+            prev_start.isoformat(),
+            prev_end.isoformat(),
+        )
+        levels, trades_count, total_volume = await self._collect_previous_day_levels(
+            provider,
+            prev_start,
+            prev_end,
+        )
+        if trades_count == 0 or not levels:
+            logger.warning("Backfill previous day returned no trades")
+            return False
+
+        self.prev_day_levels.update(levels)
+        logger.info(
+            "Backfill previous day complete: trades=%d volume=%s PDH=%s PDL=%s VAH=%s VAL=%s POC=%s",
+            trades_count,
+            self._format_float(total_volume),
+            self._format_float(levels.get("PDH")),
+            self._format_float(levels.get("PDL")),
+            self._format_float(levels.get("VAHprev")),
+            self._format_float(levels.get("VALprev")),
+            self._format_float(levels.get("POCprev")),
+        )
+        return True
+
+    async def _collect_previous_day_levels(
+        self,
+        provider: TradeHistoryProvider,
+        start: datetime,
+        end: datetime,
+    ) -> Tuple[Dict[str, Optional[float]], int, float]:
+        volume_map: defaultdict[float, float] = defaultdict(float)
+        day_high: Optional[float] = None
+        day_low: Optional[float] = None
+        total_trades = 0
+        total_volume = 0.0
+        progress_step = 50000
+
+        async for trade in provider.iterate_trades(start, end):
+            price = float(trade.price)
+            qty = float(trade.qty)
+            if qty <= 0:
+                continue
+            price_bin = self._bin_price(price)
+            volume_map[price_bin] += qty
+            total_volume += qty
+            total_trades += 1
+            if day_high is None or price > day_high:
+                day_high = price
+            if day_low is None or price < day_low:
+                day_low = price
+            if total_trades % progress_step == 0:
+                logger.info(
+                    "Backfill previous day progress: trades=%d last_price=%s",
+                    total_trades,
+                    self._format_float(price),
+                )
+
+        levels = self._profile_from_volume(dict(volume_map), day_high, day_low)
+        return levels, total_trades, total_volume
+
+    @staticmethod
+    def _format_float(value: Optional[float]) -> str:
+        if value is None:
+            return "None"
+        return f"{value:.6f}"
 
     def _profile_from_volume(
         self,
