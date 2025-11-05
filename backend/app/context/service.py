@@ -1,17 +1,36 @@
 """Context service providing trading session metrics and levels."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, ROUND_FLOOR, getcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+import httpx
 import polars as pl
 
 from app.ws.models import Settings, TradeSide, TradeTick, get_settings
 
 logger = logging.getLogger("context")
+
+getcontext().prec = 28
+
+PERIODIC_LOG_SECONDS = 600
+
+
+@dataclass(slots=True)
+class SymbolExchangeInfo:
+    symbol: str
+    tick_size: Optional[float]
+    step_size: Optional[float]
+    min_qty: Optional[float]
+    min_notional: Optional[float]
+    raw: Dict[str, Any]
 
 
 class ContextService:
@@ -21,11 +40,23 @@ class ContextService:
         self,
         settings: Optional[Settings] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
+        exchange_info: Optional[SymbolExchangeInfo] = None,
+        fetch_exchange_info: bool = True,
     ) -> None:
         self.settings = settings or get_settings()
         self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+        self._fetch_exchange_info_enabled = fetch_exchange_info
 
         self._started = False
+        self._periodic_task: Optional[asyncio.Task[None]] = None
+        self._exchange_info_logged = False
+
+        self.exchange_info: Optional[SymbolExchangeInfo] = exchange_info
+        self.tick_size: Optional[float] = exchange_info.tick_size if exchange_info else None
+        self.step_size: Optional[float] = exchange_info.step_size if exchange_info else None
+        self.min_qty: Optional[float] = exchange_info.min_qty if exchange_info else None
+        self.min_notional: Optional[float] = exchange_info.min_notional if exchange_info else None
+
         self.prev_day_levels: Dict[str, Optional[float]] = {
             "PDH": None,
             "PDL": None,
@@ -39,24 +70,41 @@ class ContextService:
         self.or_start: Optional[datetime] = None
         self.or_end: Optional[datetime] = None
 
-        self.vwap_numerator: float = 0.0
-        self.vwap_denominator: float = 0.0
+        self.sum_price_qty_base: float = 0.0
+        self.sum_qty_base: float = 0.0
+        self.sum_price_qty_quote: float = 0.0
+        self.sum_qty_quote: float = 0.0
+        self.trade_count: int = 0
+
         self.day_high: Optional[float] = None
         self.day_low: Optional[float] = None
         self.pre_market_delta: float = 0.0
         self.volume_by_price: defaultdict[float, float] = defaultdict(float)
         self.poc_price: Optional[float] = None
         self.poc_volume: float = 0.0
+        self.top_volume_bins: list[tuple[float, float]] = []
         self.total_volume: float = 0.0
         self.or_high: Optional[float] = None
         self.or_low: Optional[float] = None
         self.last_trade_price: Optional[float] = None
         self.last_trade_ts: Optional[datetime] = None
+        self.last_trade_snapshot: Optional[Dict[str, Any]] = None
+        self.first_trade_snapshot: Optional[Dict[str, Any]] = None
+        self.anchor_window_trades: list[Dict[str, Any]] = []
 
     async def startup(self) -> None:
         if self._started:
             return
         self._started = True
+
+        if self.exchange_info is None and self._fetch_exchange_info_enabled:
+            await self._ensure_exchange_info()
+
+        if self.exchange_info is not None and not self._exchange_info_logged:
+            self._log_exchange_info(self.exchange_info)
+        elif self.exchange_info is None:
+            logger.warning("exchange_info_unavailable symbol=%s", self.settings.symbol)
+
         today = self._now_provider().date()
         self._roll_day(today)
         if self.settings.context_bootstrap_prev_day:
@@ -65,8 +113,18 @@ class ContextService:
             if levels:
                 self.prev_day_levels.update(levels)
 
+        if self._periodic_task is None:
+            self._periodic_task = asyncio.create_task(self._periodic_log_loop())
+
     async def shutdown(self) -> None:
         self._started = False
+        if self._periodic_task is not None:
+            self._periodic_task.cancel()
+            try:
+                await self._periodic_task
+            except asyncio.CancelledError:
+                pass
+            self._periodic_task = None
 
     def ingest_trade(self, trade: TradeTick) -> None:
         trade_ts = trade.ts.astimezone(timezone.utc)
@@ -84,12 +142,35 @@ class ContextService:
         if qty <= 0:
             return
 
+        self.trade_count += 1
+        self.total_volume += qty
+
+        snapshot = self._snapshot_trade(trade_ts, price, qty)
+        if self.first_trade_snapshot is None:
+            self.first_trade_snapshot = snapshot
+        self.last_trade_snapshot = snapshot
+
+        day_start = self.day_start
+        if day_start and day_start <= trade_ts < day_start + timedelta(minutes=5):
+            if len(self.anchor_window_trades) < 5:
+                self.anchor_window_trades.append(snapshot)
+                logger.info(
+                    "anchor_trade #%d ts=%s price=%.2f qty=%.6f",
+                    len(self.anchor_window_trades),
+                    snapshot["ts"],
+                    price,
+                    qty,
+                )
+
         self.last_trade_price = price
         self.last_trade_ts = trade_ts
 
-        self.total_volume += qty
-        self.vwap_numerator += price * qty
-        self.vwap_denominator += qty
+        base_notional = price * qty
+        quote_volume = base_notional
+        self.sum_price_qty_base += base_notional
+        self.sum_qty_base += qty
+        self.sum_price_qty_quote += price * quote_volume
+        self.sum_qty_quote += quote_volume
 
         if self.day_high is None or price > self.day_high:
             self.day_high = price
@@ -106,19 +187,17 @@ class ContextService:
             delta = qty if trade.side == TradeSide.BUY else -qty
             self.pre_market_delta += delta
 
-        volume = self.volume_by_price[price] + qty
-        self.volume_by_price[price] = volume
-        if (volume > self.poc_volume) or (
-            abs(volume - self.poc_volume) <= 1e-9 and (self.poc_price is None or price < self.poc_price)
-        ):
-            self.poc_price = price
-            self.poc_volume = volume
+        price_bin = self._bin_price(price)
+        volume = self.volume_by_price[price_bin] + qty
+        self.volume_by_price[price_bin] = volume
+        self._update_poc_state(price_bin, volume)
 
-    def context_payload(self) -> Dict[str, Any]:
+    def context_payload(self, vwap_mode: str = "base") -> Dict[str, Any]:
+        mode = self._normalize_vwap_mode(vwap_mode)
         now = self._now_provider()
         return {
             "session": self._session_state(now),
-            "levels": self.levels_payload(),
+            "levels": self.levels_payload(mode),
             "stats": self.stats_payload(),
             "price": self.price_payload(),
         }
@@ -134,10 +213,11 @@ class ContextService:
             payload["symbol"] = symbol
         return payload
 
-    def levels_payload(self) -> Dict[str, Any]:
+    def levels_payload(self, vwap_mode: str = "base") -> Dict[str, Any]:
+        mode = self._normalize_vwap_mode(vwap_mode)
         or_start_iso = self.or_start.isoformat() if self.or_start else None
         or_end_iso = self.or_end.isoformat() if self.or_end else None
-        vwap_value = self._current_vwap()
+        vwap_value = self._current_vwap(mode)
 
         levels = {
             "OR": {
@@ -165,6 +245,46 @@ class ContextService:
             "cd_pre": self.pre_market_delta,
         }
 
+    def debug_vwap_payload(self) -> Dict[str, Any]:
+        anchor_iso = self.day_start.isoformat() if self.day_start else None
+        return {
+            "anchor": anchor_iso,
+            "sum_price_qty": self.sum_price_qty_base,
+            "sum_qty": self.sum_qty_base,
+            "vwap": self._current_vwap("base"),
+            "trade_count": self.trade_count,
+            "first_trade": self.first_trade_snapshot,
+            "last_trade": self.last_trade_snapshot,
+        }
+
+    def debug_poc_payload(self) -> Dict[str, Any]:
+        top_bins = [
+            {"price": price, "volume": volume, "rank": idx + 1}
+            for idx, (price, volume) in enumerate(self.top_volume_bins)
+        ]
+        return {
+            "bin_size": self.tick_size,
+            "top_bins": top_bins,
+            "poc_price": self.poc_price,
+            "poc_volume": self.poc_volume,
+        }
+
+    def debug_exchange_info_payload(self) -> Dict[str, Any]:
+        if not self.exchange_info:
+            return {
+                "symbol": self.settings.symbol,
+                "error": "exchange info unavailable",
+            }
+        payload = {
+            "symbol": self.exchange_info.symbol,
+            "tickSize": self.exchange_info.tick_size,
+            "stepSize": self.exchange_info.step_size,
+            "minQty": self.exchange_info.min_qty,
+            "minNotional": self.exchange_info.min_notional,
+        }
+        payload["raw"] = self.exchange_info.raw
+        return payload
+
     def _session_state(self, now: datetime) -> Dict[str, Any]:
         current_time = now.timetz()
         start_london = time(hour=8, tzinfo=timezone.utc)
@@ -190,24 +310,42 @@ class ContextService:
         self.day_start = datetime.combine(new_day, time(0, tzinfo=timezone.utc))
         self.or_start = self.day_start + timedelta(hours=8)
         self.or_end = self.or_start + timedelta(minutes=10)
-        self.vwap_numerator = 0.0
-        self.vwap_denominator = 0.0
+        self.sum_price_qty_base = 0.0
+        self.sum_qty_base = 0.0
+        self.sum_price_qty_quote = 0.0
+        self.sum_qty_quote = 0.0
+        self.trade_count = 0
         self.day_high = None
         self.day_low = None
         self.pre_market_delta = 0.0
         self.volume_by_price = defaultdict(float)
         self.poc_price = None
         self.poc_volume = 0.0
+        self.top_volume_bins = []
         self.total_volume = 0.0
         self.or_high = None
         self.or_low = None
         self.last_trade_price = None
         self.last_trade_ts = None
+        self.last_trade_snapshot = None
+        self.first_trade_snapshot = None
+        self.anchor_window_trades = []
 
-    def _current_vwap(self) -> Optional[float]:
-        if self.vwap_denominator <= 0:
+    def _current_vwap(self, mode: str = "base") -> Optional[float]:
+        normalized = self._normalize_vwap_mode(mode)
+        if normalized == "quote":
+            if self.sum_qty_quote <= 0:
+                return None
+            return self.sum_price_qty_quote / self.sum_qty_quote
+        if self.sum_qty_base <= 0:
             return None
-        return self.vwap_numerator / self.vwap_denominator
+        return self.sum_price_qty_base / self.sum_qty_base
+
+    @staticmethod
+    def _normalize_vwap_mode(mode: Optional[str]) -> str:
+        if isinstance(mode, str) and mode.lower() == "quote":
+            return "quote"
+        return "base"
 
     def _load_previous_day(self, prev_day: date) -> Dict[str, Optional[float]]:
         history_dir = Path(self.settings.context_history_dir).expanduser()
@@ -243,7 +381,8 @@ class ContextService:
         for price_raw, qty_raw in zip(prices, qtys):
             price = float(price_raw)
             qty = float(qty_raw)
-            volume_map[price] = volume_map.get(price, 0.0) + qty
+            price_bin = self._bin_price(price)
+            volume_map[price_bin] = volume_map.get(price_bin, 0.0) + qty
             if day_high is None or price > day_high:
                 day_high = price
             if day_low is None or price < day_low:
@@ -264,9 +403,7 @@ class ContextService:
         if total_volume <= 0:
             return {}
 
-        poc_price, poc_volume = max(
-            volume_map.items(), key=lambda item: (item[1], -item[0])
-        )
+        poc_price, poc_volume = max(volume_map.items(), key=lambda item: (item[1], -item[0]))
 
         sorted_by_volume = sorted(volume_map.items(), key=lambda item: (-item[1], item[0]))
         cumulative = 0.0
@@ -292,6 +429,159 @@ class ContextService:
             "VALprev": val,
             "POCprev": poc_price,
         }
+
+    def _bin_price(self, price: float) -> float:
+        tick = self.tick_size
+        if not tick or tick <= 0:
+            return price
+        price_dec = Decimal(str(price))
+        tick_dec = Decimal(str(tick))
+        bins = (price_dec / tick_dec).to_integral_value(rounding=ROUND_FLOOR)
+        return float(bins * tick_dec)
+
+    def _update_poc_state(self, price_bin: float, volume: float) -> None:
+        if (
+            self.poc_price is None
+            or volume > self.poc_volume
+            or (
+                math.isclose(volume, self.poc_volume, rel_tol=1e-12, abs_tol=1e-12)
+                and price_bin < self.poc_price
+            )
+        ):
+            self.poc_price = price_bin
+            self.poc_volume = volume
+
+        sorted_bins = sorted(self.volume_by_price.items(), key=lambda item: (-item[1], item[0]))
+        self.top_volume_bins = sorted_bins[:10]
+
+    @staticmethod
+    def _snapshot_trade(ts: datetime, price: float, qty: float) -> Dict[str, Any]:
+        return {
+            "ts": ts.isoformat(),
+            "price": price,
+            "qty": qty,
+        }
+
+    async def _ensure_exchange_info(self) -> None:
+        try:
+            info = await self._fetch_exchange_info()
+        except Exception as exc:  # pragma: no cover - logging safeguard
+            logger.exception("exchange_info_fetch_failed symbol=%s error=%s", self.settings.symbol, exc)
+            return
+
+        if info is None:
+            return
+        self._apply_exchange_info(info)
+
+    async def _fetch_exchange_info(self) -> Optional[SymbolExchangeInfo]:
+        base_url = self.settings.rest_base_url.rstrip("/")
+        endpoint = f"{base_url}/fapi/v1/exchangeInfo"
+        symbol = self.settings.symbol.upper()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=5.0)) as client:
+            response = await client.get(endpoint, params={"symbol": symbol})
+            response.raise_for_status()
+        data = response.json()
+        symbols = data.get("symbols") or []
+        symbol_entry: Optional[Dict[str, Any]] = None
+        for entry in symbols:
+            if isinstance(entry, dict) and entry.get("symbol") == symbol:
+                symbol_entry = entry
+                break
+        if not symbol_entry:
+            logger.warning("exchange_info_symbol_missing symbol=%s", symbol)
+            return None
+
+        filters = {
+            f.get("filterType"): f
+            for f in symbol_entry.get("filters", [])
+            if isinstance(f, dict) and f.get("filterType")
+        }
+
+        price_filter = filters.get("PRICE_FILTER")
+        lot_size_filter = filters.get("LOT_SIZE")
+        min_notional_filter = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL")
+
+        tick_size = self._safe_float(price_filter, "tickSize")
+        step_size = self._safe_float(lot_size_filter, "stepSize")
+        min_qty = self._safe_float(lot_size_filter, "minQty")
+        min_notional_value = self._safe_float(min_notional_filter, "notional")
+        if min_notional_value is None:
+            min_notional_value = self._safe_float(min_notional_filter, "minNotional")
+
+        return SymbolExchangeInfo(
+            symbol=symbol,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional_value,
+            raw=symbol_entry,
+        )
+
+    @staticmethod
+    def _safe_float(payload: Optional[Dict[str, Any]], key: str) -> Optional[float]:
+        if not payload:
+            return None
+        value = payload.get(key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):  # pragma: no cover - defensive parsing
+            return None
+
+    def _apply_exchange_info(self, info: SymbolExchangeInfo) -> None:
+        self.exchange_info = info
+        self.tick_size = info.tick_size
+        self.step_size = info.step_size
+        self.min_qty = info.min_qty
+        self.min_notional = info.min_notional
+        self._log_exchange_info(info)
+
+    def _log_exchange_info(self, info: SymbolExchangeInfo) -> None:
+        logger.info(
+            "exchange_info_loaded symbol=%s tickSize=%s stepSize=%s minQty=%s minNotional=%s",
+            info.symbol,
+            info.tick_size,
+            info.step_size,
+            info.min_qty,
+            info.min_notional,
+        )
+        self._exchange_info_logged = True
+
+    async def _periodic_log_loop(self) -> None:
+        try:
+            while self._started:
+                await asyncio.sleep(PERIODIC_LOG_SECONDS)
+                if not self._started:
+                    break
+                self._log_snapshot()
+        except asyncio.CancelledError:  # pragma: no cover - cooperative cancellation
+            pass
+
+    def _log_snapshot(self) -> None:
+        if not self.day_start:
+            return
+        now = self._now_provider()
+        if not self._within_active_session(now):
+            return
+        vwap_value = self._current_vwap("base")
+        anchor_iso = self.day_start.isoformat()
+        vwap_repr = f"{vwap_value:.10f}" if vwap_value is not None else "None"
+        poc_repr = f"{self.poc_price:.10f}" if self.poc_price is not None else "None"
+        logger.info(
+            "context_snapshot anchor=%s vwap=%s poc=%s sum_pv=%.10f sum_v=%.10f trades=%d",
+            anchor_iso,
+            vwap_repr,
+            poc_repr,
+            self.sum_price_qty_base,
+            self.sum_qty_base,
+            self.trade_count,
+        )
+
+    def _within_active_session(self, now: datetime) -> bool:
+        if not self.day_start:
+            return False
+        return self.day_start <= now < self.day_start + timedelta(days=1)
 
 
 _service_instance: Optional[ContextService] = None

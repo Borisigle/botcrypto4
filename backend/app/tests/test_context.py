@@ -30,7 +30,11 @@ async def test_vwap_and_opening_range_boundaries() -> None:
     current_now = [datetime(2024, 1, 1, 9, tzinfo=timezone.utc)]
 
     settings = Settings(context_bootstrap_prev_day=False)
-    service = ContextService(settings=settings, now_provider=lambda: current_now[0])
+    service = ContextService(
+        settings=settings,
+        now_provider=lambda: current_now[0],
+        fetch_exchange_info=False,
+    )
     await service.startup()
 
     trade_id = 1
@@ -116,7 +120,11 @@ async def test_vwap_and_opening_range_boundaries() -> None:
 async def test_poc_computation_with_synthetic_profile() -> None:
     now = [datetime(2024, 2, 2, 11, tzinfo=timezone.utc)]
     settings = Settings(context_bootstrap_prev_day=False)
-    service = ContextService(settings=settings, now_provider=lambda: now[0])
+    service = ContextService(
+        settings=settings,
+        now_provider=lambda: now[0],
+        fetch_exchange_info=False,
+    )
     await service.startup()
 
     start_ts = datetime(2024, 2, 2, 0, 5, tzinfo=timezone.utc)
@@ -156,7 +164,11 @@ async def test_poc_computation_with_synthetic_profile() -> None:
 async def test_price_payload_tracks_last_trade() -> None:
     now = [datetime(2024, 3, 3, 14, tzinfo=timezone.utc)]
     settings = Settings(context_bootstrap_prev_day=False)
-    service = ContextService(settings=settings, now_provider=lambda: now[0])
+    service = ContextService(
+        settings=settings,
+        now_provider=lambda: now[0],
+        fetch_exchange_info=False,
+    )
     await service.startup()
 
     empty_payload = service.price_payload()
