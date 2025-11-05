@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.context.service import ContextService
+from app.context.service import ContextService, SymbolExchangeInfo
 from app.ws.models import Settings, TradeSide, TradeTick
 
 
@@ -25,11 +25,24 @@ def _make_trade(
     )
 
 
+class FakeHistoryProvider:
+    def __init__(self, trades: list[TradeTick]) -> None:
+        self._trades = sorted(trades, key=lambda trade: trade.ts)
+
+    async def iterate_trades(self, start: datetime, end: datetime):
+        for trade in self._trades:
+            if start <= trade.ts <= end:
+                yield trade
+
+
 @pytest.mark.asyncio
 async def test_vwap_and_opening_range_boundaries() -> None:
     current_now = [datetime(2024, 1, 1, 9, tzinfo=timezone.utc)]
 
-    settings = Settings(context_bootstrap_prev_day=False)
+    settings = Settings(
+        context_bootstrap_prev_day=False,
+        context_backfill_enabled=False,
+    )
     service = ContextService(
         settings=settings,
         now_provider=lambda: current_now[0],
@@ -119,7 +132,10 @@ async def test_vwap_and_opening_range_boundaries() -> None:
 @pytest.mark.asyncio
 async def test_poc_computation_with_synthetic_profile() -> None:
     now = [datetime(2024, 2, 2, 11, tzinfo=timezone.utc)]
-    settings = Settings(context_bootstrap_prev_day=False)
+    settings = Settings(
+        context_bootstrap_prev_day=False,
+        context_backfill_enabled=False,
+    )
     service = ContextService(
         settings=settings,
         now_provider=lambda: now[0],
@@ -161,9 +177,84 @@ async def test_poc_computation_with_synthetic_profile() -> None:
 
 
 @pytest.mark.asyncio
+async def test_backfill_initializes_metrics_from_history() -> None:
+    now = datetime(2024, 4, 2, 12, tzinfo=timezone.utc)
+
+    settings = Settings(
+        context_bootstrap_prev_day=False,
+        context_backfill_enabled=True,
+    )
+    exchange_info = SymbolExchangeInfo(
+        symbol=settings.symbol,
+        tick_size=50.0,
+        step_size=None,
+        min_qty=None,
+        min_notional=None,
+        raw={},
+    )
+
+    sequence = {"id": 0}
+
+    def next_trade(
+        ts: datetime,
+        price: float,
+        qty: float,
+        side: TradeSide,
+    ) -> TradeTick:
+        sequence["id"] += 1
+        return _make_trade(ts, price, qty, side, sequence["id"])
+
+    prev_trades = [
+        next_trade(datetime(2024, 4, 1, 1, tzinfo=timezone.utc), 100.0, 5.0, TradeSide.BUY),
+        next_trade(datetime(2024, 4, 1, 10, tzinfo=timezone.utc), 110.0, 4.0, TradeSide.BUY),
+        next_trade(datetime(2024, 4, 1, 15, tzinfo=timezone.utc), 90.0, 3.0, TradeSide.SELL),
+    ]
+    today_trades = [
+        next_trade(datetime(2024, 4, 2, 0, 15, tzinfo=timezone.utc), 101.0, 1.0, TradeSide.BUY),
+        next_trade(datetime(2024, 4, 2, 7, tzinfo=timezone.utc), 102.0, 2.0, TradeSide.SELL),
+        next_trade(datetime(2024, 4, 2, 8, 5, tzinfo=timezone.utc), 105.0, 2.0, TradeSide.BUY),
+        next_trade(datetime(2024, 4, 2, 9, tzinfo=timezone.utc), 103.0, 1.0, TradeSide.BUY),
+        next_trade(datetime(2024, 4, 2, 13, tzinfo=timezone.utc), 104.0, 1.0, TradeSide.BUY),
+    ]
+
+    provider = FakeHistoryProvider(prev_trades + today_trades)
+
+    service = ContextService(
+        settings=settings,
+        now_provider=lambda: now,
+        exchange_info=exchange_info,
+        history_provider=provider,
+        fetch_exchange_info=False,
+    )
+    await service.startup()
+
+    payload = service.context_payload()
+    levels = payload["levels"]
+    stats = payload["stats"]
+
+    expected_vwap = 722.0 / 7.0
+    assert levels["VWAP"] == pytest.approx(expected_vwap)
+    assert levels["POCd"] == pytest.approx(100.0)
+    assert levels["PDH"] == pytest.approx(110.0)
+    assert levels["PDL"] == pytest.approx(90.0)
+    assert levels["VAHprev"] == pytest.approx(100.0)
+    assert levels["VALprev"] == pytest.approx(100.0)
+    assert levels["POCprev"] == pytest.approx(100.0)
+    assert levels["OR"]["hi"] == pytest.approx(105.0)
+    assert levels["OR"]["lo"] == pytest.approx(105.0)
+    assert stats["cd_pre"] == pytest.approx(-1.0)
+    assert stats["rangeToday"] == pytest.approx(4.0)
+
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_price_payload_tracks_last_trade() -> None:
     now = [datetime(2024, 3, 3, 14, tzinfo=timezone.utc)]
-    settings = Settings(context_bootstrap_prev_day=False)
+    settings = Settings(
+        context_bootstrap_prev_day=False,
+        context_backfill_enabled=False,
+    )
     service = ContextService(
         settings=settings,
         now_provider=lambda: now[0],
