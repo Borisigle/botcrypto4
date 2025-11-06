@@ -3,5 +3,6 @@ uvicorn[standard]==0.27.1
 python-dotenv==1.0.1
 websockets==12.0
 httpx==0.27.0
+aiohttp==3.10.5
 pytest==8.2.2
 polars==1.7.1

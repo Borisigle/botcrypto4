@@ -93,6 +93,15 @@ class Settings:
     context_backfill_enabled: bool = field(
         default_factory=lambda: _env_bool("CONTEXT_BACKFILL_ENABLED", "true")
     )
+    binance_api_timeout: int = field(
+        default_factory=lambda: int(os.getenv("BINANCE_API_TIMEOUT", "30"))
+    )
+    backfill_max_retries: int = field(
+        default_factory=lambda: int(os.getenv("BACKFILL_MAX_RETRIES", "5"))
+    )
+    backfill_retry_base: float = field(
+        default_factory=lambda: float(os.getenv("BACKFILL_RETRY_BASE", "0.5"))
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")

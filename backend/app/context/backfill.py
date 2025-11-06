@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone, timedelta
 from typing import AsyncIterator, Callable, Optional, Protocol, List, Tuple
 
-import httpx
+import aiohttp
 
 from app.ws.models import Settings, TradeTick
 from app.ws.trades import parse_trade_message
@@ -21,6 +22,103 @@ class TradeHistoryProvider(Protocol):
         """Yield trades ordered by timestamp covering ``start`` to ``end``."""
 
 
+class BinanceHttpClient:
+    """HTTP client for Binance API with proper headers, session management, and retry logic."""
+    
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+        }
+        self.max_retries = settings.backfill_max_retries
+        self.retry_base = settings.backfill_retry_base
+        
+    async def connect(self):
+        """Initialize HTTP session if not already created."""
+        if self.session is None:
+            timeout = aiohttp.ClientTimeout(total=self.settings.binance_api_timeout)
+            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+            self.session = aiohttp.ClientSession(
+                headers=self.headers,
+                timeout=timeout,
+                connector=connector
+            )
+            logger.info("HTTP session created, headers set")
+    
+    async def close(self):
+        """Close HTTP session."""
+        if self.session:
+            await self.session.close()
+            self.session = None
+    
+    async def fetch_agg_trades(
+        self,
+        symbol: str,
+        start_time: int,
+        end_time: int,
+        limit: int = 1000
+    ) -> List[dict]:
+        """Fetch aggregated trades with retry logic."""
+        await self.connect()
+        
+        url = f"{self.settings.rest_base_url.rstrip('/')}/fapi/v1/aggTrades"
+        params = {
+            "symbol": symbol.upper(),
+            "startTime": start_time,
+            "endTime": end_time,
+            "limit": limit
+        }
+        
+        for attempt in range(self.max_retries):
+            try:
+                async with self.session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status in {418, 429, 451}:
+                        # Rate limited, blocked, or geographic restriction
+                        if attempt < self.max_retries - 1:
+                            delay = self._exponential_backoff(attempt)
+                            logger.warning(
+                                f"HTTP {resp.status} error, retrying in {delay:.2f}s (attempt {attempt+1}/{self.max_retries})"
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            raise Exception(f"Max retries exceeded for {url} (HTTP {resp.status})")
+                    else:
+                        logger.error(f"Unexpected status {resp.status}")
+                        raise Exception(f"HTTP {resp.status}")
+            except asyncio.TimeoutError:
+                if attempt < self.max_retries - 1:
+                    delay = self._exponential_backoff(attempt)
+                    logger.warning(f"Timeout on attempt {attempt+1}, retrying in {delay:.2f}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    delay = self._exponential_backoff(attempt)
+                    logger.warning(f"Error on attempt {attempt+1}, retrying in {delay:.2f}s: {e}")
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+        
+        raise Exception("All retries failed")
+    
+    def _exponential_backoff(self, attempt: int, base: Optional[float] = None, max_delay: float = 30) -> float:
+        """Calculate exponential backoff with jitter."""
+        if base is None:
+            base = self.retry_base
+        delay = base * (2 ** attempt)
+        delay = min(delay, max_delay)
+        jitter = delay * 0.2 * (random.random() - 0.5)
+        return delay + jitter
+
+
 class BinanceTradeHistory:
     """Paginated loader for Binance aggregated trades using the REST API."""
 
@@ -30,7 +128,6 @@ class BinanceTradeHistory:
         *,
         limit: int = 1000,
         request_delay: float = 0.1,
-        http_client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
         max_retries: int = 5,
         chunk_minutes: int = 10,
         max_concurrent_chunks: int = 10,
@@ -39,13 +136,11 @@ class BinanceTradeHistory:
         self.settings = settings
         self.limit = max(1, limit)
         self.request_delay = max(0.0, request_delay)
-        self._http_client_factory = http_client_factory or self._default_client_factory
         self._max_retries = max(0, max_retries)
-        self._retry_base_delay = 0.25
-        self._retry_max_delay = 5.0
         self.chunk_minutes = max(1, chunk_minutes)
         self.max_concurrent_chunks = max(1, max_concurrent_chunks)
         self.max_iterations_per_chunk = max(1, max_iterations_per_chunk)
+        self.http_client = BinanceHttpClient(settings)
 
     async def iterate_trades(self, start: datetime, end: datetime) -> AsyncIterator[TradeTick]:
         start_utc = self._ensure_utc(start)
@@ -55,21 +150,25 @@ class BinanceTradeHistory:
         if start_ms > end_ms:
             return
 
-        # For small windows (< 30 minutes), use single-threaded approach
-        if end_ms - start_ms < 30 * 60 * 1000:
-            async for trade in self._fetch_trades_paginated(start_utc, end_utc):
-                yield trade
-            return
+        try:
+            # For small windows (< 30 minutes), use single-threaded approach
+            if end_ms - start_ms < 30 * 60 * 1000:
+                trades = await self._fetch_trades_paginated(start_utc, end_utc)
+                for trade in trades:
+                    yield trade
+                return
 
-        # Use parallel backfill for larger windows
-        all_trades = await self._backfill_parallel(start_utc, end_utc)
-        
-        # Sort by timestamp to ensure chronological order
-        all_trades.sort(key=lambda t: t.ts)
-        
-        # Yield trades one by one
-        for trade in all_trades:
-            yield trade
+            # Use parallel backfill for larger windows
+            all_trades = await self._backfill_parallel(start_utc, end_utc)
+            
+            # Sort by timestamp to ensure chronological order
+            all_trades.sort(key=lambda t: t.ts)
+            
+            # Yield trades one by one
+            for trade in all_trades:
+                yield trade
+        finally:
+            await self.http_client.close()
 
     async def _backfill_parallel(self, start_dt: datetime, end_dt: datetime) -> List[TradeTick]:
         """Split time window into chunks and download in parallel."""
@@ -134,11 +233,17 @@ class BinanceTradeHistory:
             )
         
         elapsed_time = time.time() - start_time
+        vwap = (
+            sum(trade.price * trade.qty for trade in all_trades) / sum(trade.qty for trade in all_trades)
+            if all_trades else 0.0
+        )
         logger.info(
-            "Backfill complete: %d trades in %.2fs, VWAP=%.3f",
+            "Backfill complete: %d trades in %.2fs, VWAP=%.3f, %d/%d chunks successful",
             len(all_trades),
             elapsed_time,
-            sum(trade.price * trade.qty for trade in all_trades) / sum(trade.qty for trade in all_trades) if all_trades else 0.0,
+            vwap,
+            total_chunks_successful,
+            len(chunks),
         )
         
         return all_trades
@@ -161,26 +266,20 @@ class BinanceTradeHistory:
         start_ms = int(start_dt.timestamp() * 1000)
         end_ms = int(end_dt.timestamp() * 1000)
         
-        endpoint = f"{self.settings.rest_base_url.rstrip('/')}/fapi/v1/aggTrades"
-        params_base = {
-            "symbol": self.settings.symbol.upper(),
-            "limit": self.limit,
-        }
-        
         trades = []
         current_start = start_ms
         iteration = 0
+        total_retries = 0
         
-        async with self._http_client_factory() as client:
-            while current_start <= end_ms and iteration < self.max_iterations_per_chunk:
-                response = await self._request_with_retry(
-                    client,
-                    endpoint,
-                    params_base,
+        while current_start <= end_ms and iteration < self.max_iterations_per_chunk:
+            try:
+                payload = await self.http_client.fetch_agg_trades(
+                    symbol=self.settings.symbol,
                     start_time=current_start,
                     end_time=end_ms,
+                    limit=self.limit,
                 )
-                payload = response.json()
+                
                 if not isinstance(payload, list) or not payload:
                     break
                 
@@ -219,13 +318,34 @@ class BinanceTradeHistory:
                 # Progress logging every 10 iterations (not every trade)
                 if iteration % 10 == 0:
                     logger.info(
-                        "Backfill chunk progress: %d trades loaded, %d iterations",
+                        "Backfill chunk progress: %d trades loaded, %d iterations, %d retries",
                         len(trades),
                         iteration,
+                        total_retries,
                     )
                 
                 if self.request_delay > 0:
                     await asyncio.sleep(self.request_delay)
+                    
+            except Exception as e:
+                total_retries += 1
+                if "Max retries exceeded" in str(e) or total_retries > self._max_retries * 2:
+                    logger.error(
+                        "Backfill failed for window %s to %s after %d retries: %s",
+                        start_dt.isoformat(),
+                        end_dt.isoformat(),
+                        total_retries,
+                        e,
+                    )
+                    raise
+                logger.warning(
+                    "Backfill retry %d for window %s to %s: %s",
+                    total_retries,
+                    start_dt.isoformat(),
+                    end_dt.isoformat(),
+                    e,
+                )
+                await asyncio.sleep(self.http_client._exponential_backoff(total_retries))
         
         # Safety limit check
         if iteration >= self.max_iterations_per_chunk - 1:
@@ -244,54 +364,3 @@ class BinanceTradeHistory:
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
-
-    def _default_client_factory(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
-
-    async def _request_with_retry(
-        self,
-        client: httpx.AsyncClient,
-        endpoint: str,
-        params_base: dict[str, int | str],
-        *,
-        start_time: int,
-        end_time: int,
-    ) -> httpx.Response:
-        attempt = 0
-        while True:
-            params = dict(params_base)
-            params["startTime"] = start_time
-            params["endTime"] = end_time
-            try:
-                response = await client.get(endpoint, params=params)
-                response.raise_for_status()
-                return response
-            except httpx.HTTPStatusError as exc:
-                if (
-                    exc.response.status_code in {418, 429, 500, 503}
-                    and attempt < self._max_retries
-                ):
-                    delay = min(self._retry_base_delay * (2**attempt), self._retry_max_delay)
-                    logger.warning(
-                        "backfill_http_retry status=%s delay=%.2f attempt=%d",
-                        exc.response.status_code,
-                        delay,
-                        attempt + 1,
-                    )
-                    await asyncio.sleep(delay)
-                    attempt += 1
-                    continue
-                raise
-            except httpx.TransportError as exc:
-                if attempt < self._max_retries:
-                    delay = min(self._retry_base_delay * (2**attempt), self._retry_max_delay)
-                    logger.warning(
-                        "backfill_transport_retry error=%s delay=%.2f attempt=%d",
-                        exc,
-                        delay,
-                        attempt + 1,
-                    )
-                    await asyncio.sleep(delay)
-                    attempt += 1
-                    continue
-                raise
