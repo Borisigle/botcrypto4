@@ -338,3 +338,57 @@ class TestBinanceTradeHistory:
         assert history.http_client.use_auth is True
         
         await history.http_client.close()
+
+    @pytest.mark.asyncio
+    async def test_test_mode_configuration(self, mock_settings_with_auth):
+        """Test that test mode is properly configured."""
+        # Enable test mode
+        mock_settings_with_auth.context_backfill_test_mode = True
+        
+        history = BinanceTradeHistory(settings=mock_settings_with_auth)
+        
+        # Test that test mode is detected
+        assert history.test_mode is True
+        assert history.max_concurrent_chunks == 1  # Serial execution
+        assert history.request_delay == 0.0  # No delay needed
+        
+        # Test that HTTP client has auth enabled
+        assert history.http_client.use_auth is True
+        
+        await history.http_client.close()
+
+    @pytest.mark.asyncio
+    async def test_test_mode_without_auth(self, mock_settings):
+        """Test that test mode works without authentication."""
+        # Enable test mode without auth
+        mock_settings.context_backfill_test_mode = True
+        
+        history = BinanceTradeHistory(settings=mock_settings)
+        
+        # Test that test mode is detected
+        assert history.test_mode is True
+        assert history.max_concurrent_chunks == 1  # Serial execution
+        assert history.request_delay == 0.0  # No delay needed
+        
+        # Test that HTTP client has auth disabled
+        assert history.http_client.use_auth is False
+        
+        await history.http_client.close()
+
+    @pytest.mark.asyncio
+    async def test_test_single_window_method(self, mock_settings_with_auth):
+        """Test the test_single_window method exists and can be called."""
+        # Enable test mode
+        mock_settings_with_auth.context_backfill_test_mode = True
+        
+        history = BinanceTradeHistory(settings=mock_settings_with_auth)
+        
+        # Test that the method exists
+        assert hasattr(history, 'test_single_window')
+        assert callable(history.test_single_window)
+        
+        # Test that it's an async method
+        import inspect
+        assert inspect.iscoroutinefunction(history.test_single_window)
+        
+        await history.http_client.close()
