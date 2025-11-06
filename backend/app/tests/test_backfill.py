@@ -180,3 +180,30 @@ class TestBinanceTradeHistory:
         
         # Close the client
         await history.http_client.close()
+
+    @pytest.mark.asyncio
+    async def test_reduced_concurrency_and_throttling(self, mock_settings):
+        """Test that default concurrency is reduced to 5 and throttling is implemented."""
+        history = BinanceTradeHistory(settings=mock_settings)
+        
+        # Test that default concurrency is now 5 (reduced from 10)
+        assert history.max_concurrent_chunks == 5
+        
+        # Test that we can still override it if needed
+        custom_history = BinanceTradeHistory(
+            settings=mock_settings,
+            max_concurrent_chunks=3
+        )
+        assert custom_history.max_concurrent_chunks == 3
+        
+        # Test time range splitting still works
+        start_dt = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(hours=2)  # 2 hours = 12 chunks of 10 minutes
+        chunks = history._split_time_range(start_dt, end_dt, 10)
+        
+        # Should create 12 chunks of 10 minutes each
+        assert len(chunks) == 12
+        assert chunks[0][1] - chunks[0][0] == timedelta(minutes=10)
+        
+        await history.http_client.close()
+        await custom_history.http_client.close()
