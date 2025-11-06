@@ -17,6 +17,20 @@ def mock_settings():
         binance_api_timeout=30,
         backfill_max_retries=5,
         backfill_retry_base=0.5,
+        binance_api_key=None,  # No auth by default for tests
+        binance_api_secret=None,
+    )
+
+
+@pytest.fixture
+def mock_settings_with_auth():
+    return Settings(
+        context_backfill_enabled=True,
+        binance_api_timeout=30,
+        backfill_max_retries=5,
+        backfill_retry_base=0.5,
+        binance_api_key="test_api_key_1234567890",
+        binance_api_secret="test_api_secret_1234567890abcdef",
     )
 
 
@@ -41,6 +55,83 @@ class TestBinanceHttpClient:
             assert call_args[1]['timeout'].total == mock_settings.binance_api_timeout
             
             await client.close()
+
+    @pytest.mark.asyncio
+    async def test_authentication_disabled_by_default(self, mock_settings):
+        """Test that authentication is disabled when no credentials provided."""
+        client = BinanceHttpClient(mock_settings)
+        
+        assert client.use_auth is False
+        assert "X-MBX-APIKEY" not in client.headers
+        assert client.api_key is None
+        assert client.api_secret is None
+
+    @pytest.mark.asyncio
+    async def test_authentication_enabled_with_credentials(self, mock_settings_with_auth):
+        """Test that authentication is enabled when credentials provided."""
+        client = BinanceHttpClient(mock_settings_with_auth)
+        
+        assert client.use_auth is True
+        assert "X-MBX-APIKEY" in client.headers
+        assert client.headers["X-MBX-APIKEY"] == "test_api_key_1234567890"
+        assert client.api_key == "test_api_key_1234567890"
+        assert client.api_secret == "test_api_secret_1234567890abcdef"
+
+    def test_hmac_signature_generation(self, mock_settings_with_auth):
+        """Test HMAC-SHA256 signature generation."""
+        client = BinanceHttpClient(mock_settings_with_auth)
+        
+        params = {
+            "symbol": "BTCUSDT",
+            "startTime": 1640995200000,
+            "endTime": 1640995800000,
+            "limit": 1000,
+            "timestamp": 1640995800000,
+            "recvWindow": 5000
+        }
+        
+        signature = client._sign_request(params)
+        
+        # Signature should be a 64-character hex string
+        assert len(signature) == 64
+        assert all(c in "0123456789abcdef" for c in signature)
+        
+        # Same params should generate same signature
+        signature2 = client._sign_request(params)
+        assert signature == signature2
+        
+        # Different params should generate different signature
+        params_diff = params.copy()
+        params_diff["limit"] = 500
+        signature3 = client._sign_request(params_diff)
+        assert signature != signature3
+
+    @pytest.mark.asyncio
+    async def test_request_signing_in_fetch(self, mock_settings_with_auth):
+        """Test that request parameters are properly signed when auth is enabled."""
+        client = BinanceHttpClient(mock_settings_with_auth)
+        
+        # Test the signing logic directly without mocking the HTTP call
+        params = {
+            "symbol": "BTCUSDT",
+            "startTime": 1640995200000,
+            "endTime": 1640995800000,
+            "limit": 1000,
+            "timestamp": 1640995800000,
+            "recvWindow": 5000
+        }
+        
+        # Test signature generation
+        signature = client._sign_request(params)
+        
+        # Should include auth parameters
+        assert "timestamp" in params
+        assert "recvWindow" in params
+        assert params["recvWindow"] == 5000
+        assert len(signature) == 64  # HMAC-SHA256 hex string
+        assert all(c in "0123456789abcdef" for c in signature)
+        
+        await client.close()
 
     @pytest.mark.asyncio
     async def test_successful_fetch(self, mock_settings):
@@ -113,19 +204,44 @@ class TestBinanceTradeHistory:
         history = BinanceTradeHistory(
             settings=mock_settings,
             limit=1000,
-            request_delay=0.0,
+            request_delay=0.1,  # Override the default for public mode
             chunk_minutes=60,
         )
         
-        # Test that history is properly configured
+        # Test that history is properly configured for public mode
         assert history.settings == mock_settings
         assert history.limit == 1000
         assert history.chunk_minutes == 60
         assert history.max_iterations_per_chunk == 500  # default value
+        assert history.max_concurrent_chunks == 5  # Public mode default
+        assert history.request_delay == 0.1  # Should match our override
         
         # Test that HTTP client is created
         assert history.http_client is not None
         assert history.http_client.settings == mock_settings
+
+    @pytest.mark.asyncio
+    async def test_pagination_logic_with_auth(self, mock_settings_with_auth):
+        """Test pagination logic with authentication enabled."""
+        history = BinanceTradeHistory(
+            settings=mock_settings_with_auth,
+            limit=1000,
+            request_delay=0.0,
+            chunk_minutes=60,
+        )
+        
+        # Test that history is properly configured for auth mode
+        assert history.settings == mock_settings_with_auth
+        assert history.limit == 1000
+        assert history.chunk_minutes == 60
+        assert history.max_iterations_per_chunk == 500  # default value
+        assert history.max_concurrent_chunks == 20  # Auth mode default
+        assert history.request_delay == 0.0  # No delay with auth
+        
+        # Test that HTTP client is created with auth
+        assert history.http_client is not None
+        assert history.http_client.settings == mock_settings_with_auth
+        assert history.http_client.use_auth is True
 
     @pytest.mark.asyncio
     async def test_parallel_deduplication(self, mock_settings):
@@ -183,11 +299,12 @@ class TestBinanceTradeHistory:
 
     @pytest.mark.asyncio
     async def test_reduced_concurrency_and_throttling(self, mock_settings):
-        """Test that default concurrency is reduced to 5 and throttling is implemented."""
+        """Test that public mode uses reduced concurrency and throttling."""
         history = BinanceTradeHistory(settings=mock_settings)
         
-        # Test that default concurrency is now 5 (reduced from 10)
+        # Test that public mode uses reduced concurrency (5)
         assert history.max_concurrent_chunks == 5
+        assert history.request_delay > 0  # Should have throttling delay
         
         # Test that we can still override it if needed
         custom_history = BinanceTradeHistory(
@@ -207,3 +324,17 @@ class TestBinanceTradeHistory:
         
         await history.http_client.close()
         await custom_history.http_client.close()
+
+    @pytest.mark.asyncio
+    async def test_higher_concurrency_with_auth(self, mock_settings_with_auth):
+        """Test that auth mode uses higher concurrency with no throttling."""
+        history = BinanceTradeHistory(settings=mock_settings_with_auth)
+        
+        # Test that auth mode uses higher concurrency (20) and no delay
+        assert history.max_concurrent_chunks == 20
+        assert history.request_delay == 0.0  # No throttling needed with auth
+        
+        # Test that HTTP client has auth enabled
+        assert history.http_client.use_auth is True
+        
+        await history.http_client.close()

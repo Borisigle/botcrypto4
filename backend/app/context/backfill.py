@@ -4,8 +4,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
+import hmac
+import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import AsyncIterator, Callable, Optional, Protocol, List, Tuple
+from urllib.parse import urlencode
 
 import aiohttp
 
@@ -23,17 +27,32 @@ class TradeHistoryProvider(Protocol):
 
 
 class BinanceHttpClient:
-    """HTTP client for Binance API with proper headers, session management, and retry logic."""
+    """HTTP client for Binance API with proper headers, session management, retry logic, and optional HMAC authentication."""
     
     def __init__(self, settings: Settings):
         self.settings = settings
         self.session: Optional[aiohttp.ClientSession] = None
+        self.api_key = settings.binance_api_key
+        self.api_secret = settings.binance_api_secret
+        self.use_auth = bool(self.api_key and self.api_secret)
+        
+        # Base headers
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",
         }
+        
+        # Add API key header if authentication is enabled
+        if self.use_auth:
+            self.headers["X-MBX-APIKEY"] = self.api_key
+            # Log truncated API key for security
+            key_preview = f"{self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else "***"
+            logger.info(f"Binance auth: enabled (API key: {key_preview})")
+        else:
+            logger.info("Binance auth: disabled (using public endpoints)")
+            
         self.max_retries = settings.backfill_max_retries
         self.retry_base = settings.backfill_retry_base
         
@@ -55,6 +74,23 @@ class BinanceHttpClient:
             await self.session.close()
             self.session = None
     
+    def _sign_request(self, params: dict) -> str:
+        """Generate HMAC-SHA256 signature for authenticated requests."""
+        if not self.use_auth:
+            return ""
+            
+        # Create query string from parameters
+        query_string = urlencode(sorted(params.items()))
+        
+        # Generate HMAC-SHA256 signature
+        signature = hmac.new(
+            self.api_secret.encode(),
+            query_string.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return signature
+    
     async def fetch_agg_trades(
         self,
         symbol: str,
@@ -62,7 +98,7 @@ class BinanceHttpClient:
         end_time: int,
         limit: int = 1000
     ) -> List[dict]:
-        """Fetch aggregated trades with retry logic."""
+        """Fetch aggregated trades with retry logic and optional HMAC authentication."""
         await self.connect()
         
         url = f"{self.settings.rest_base_url.rstrip('/')}/fapi/v1/aggTrades"
@@ -73,11 +109,41 @@ class BinanceHttpClient:
             "limit": limit
         }
         
+        # Add authentication parameters if enabled
+        if self.use_auth:
+            params["timestamp"] = int(time.time() * 1000)
+            params["recvWindow"] = 5000
+            signature = self._sign_request(params)
+            params["signature"] = signature
+        
         for attempt in range(self.max_retries):
             try:
                 async with self.session.get(url, params=params) as resp:
                     if resp.status == 200:
                         return await resp.json()
+                    elif resp.status == 401:
+                        # Unauthorized - likely bad credentials
+                        logger.error("Binance API authentication failed (401). Check your API credentials.")
+                        if attempt == 0:
+                            logger.info("Falling back to public endpoints for subsequent requests...")
+                            self.use_auth = False
+                            # Remove auth params and retry
+                            params.pop("timestamp", None)
+                            params.pop("recvWindow", None)
+                            params.pop("signature", None)
+                            continue
+                        else:
+                            raise Exception("Authentication failed and fallback unsuccessful")
+                    elif resp.status == 403:
+                        # Forbidden - API key restrictions
+                        logger.warning("Binance API access forbidden (403). Check API key permissions.")
+                        if attempt < self.max_retries - 1:
+                            delay = self._exponential_backoff(attempt)
+                            logger.warning(f"Retrying in {delay:.2f}s (attempt {attempt+1}/{self.max_retries})")
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            raise Exception(f"API access forbidden (403) after {self.max_retries} retries")
                     elif resp.status in {418, 429, 451}:
                         # Rate limited, blocked, or geographic restriction
                         if attempt < self.max_retries - 1:
@@ -138,7 +204,22 @@ class BinanceTradeHistory:
         self.request_delay = max(0.0, request_delay)
         self._max_retries = max(0, max_retries)
         self.chunk_minutes = max(1, chunk_minutes)
-        self.max_concurrent_chunks = max(1, max_concurrent_chunks)
+        
+        # Use higher concurrency when authentication is enabled
+        api_key = settings.binance_api_key
+        api_secret = settings.binance_api_secret
+        use_auth = bool(api_key and api_secret)
+        
+        if use_auth:
+            # Aggressive parallelization with auth (higher rate limits)
+            self.max_concurrent_chunks = 20
+            self.request_delay = 0.0  # No delay needed with auth
+            logger.info("Backfill: Using authenticated mode with 20 concurrent chunks")
+        else:
+            # Conservative settings for public endpoints
+            self.max_concurrent_chunks = max(1, max_concurrent_chunks)
+            logger.info(f"Backfill: Using public mode with {self.max_concurrent_chunks} concurrent chunks")
+            
         self.max_iterations_per_chunk = max(1, max_iterations_per_chunk)
         self.http_client = BinanceHttpClient(settings)
 
@@ -190,8 +271,9 @@ class BinanceTradeHistory:
         
         async def fetch_chunk_throttled(chunk_index: int, chunk_start: datetime, chunk_end: datetime) -> Tuple[int, List[TradeTick]]:
             async with semaphore:
-                # Add 50-100ms delay between fetches for gentle throttling
-                await asyncio.sleep(0.05 + (random.random() * 0.05))
+                # Add delay only for public endpoints to avoid 418 errors
+                if self.request_delay > 0:
+                    await asyncio.sleep(self.request_delay + (random.random() * 0.05))
                 try:
                     trades = await self._fetch_trades_paginated(chunk_start, chunk_end)
                     return chunk_index, trades
@@ -260,19 +342,43 @@ class BinanceTradeHistory:
         
         elapsed_time = time.time() - start_time
         success_rate = (len(chunks) - failed_chunks) / len(chunks) * 100
+        
+        # Calculate VWAP
         vwap = (
             sum(trade.price * trade.qty for trade in all_trades) / sum(trade.qty for trade in all_trades)
             if all_trades else 0.0
         )
+        
+        # Calculate POC (Point of Control - price level with maximum volume)
+        poc_price = 0.0
+        if all_trades:
+            # Group trades by price level (rounded to 3 decimal places for BTCUSDT)
+            price_volumes = {}
+            for trade in all_trades:
+                price_rounded = round(trade.price, 3)
+                price_volumes[price_rounded] = price_volumes.get(price_rounded, 0) + trade.qty
+            
+            # Find price with maximum volume
+            if price_volumes:
+                poc_price = max(price_volumes, key=price_volumes.get)
+        
         logger.info(
-            "Backfill complete: %d trades in %.1fs, %.1f%% chunks successful (%d/%d), VWAP=%.3f",
+            "Backfill complete: ~%d trades in %.1fs, %.1f%% chunks successful (%d/%d)",
             len(all_trades),
             elapsed_time,
             success_rate,
             successful_chunks,
             len(chunks),
+        )
+        logger.info(
+            "  VWAP: %.3f",
             vwap,
         )
+        if poc_price > 0:
+            logger.info(
+                "  POCd: %.3f",
+                poc_price,
+            )
         
         return all_trades
 
