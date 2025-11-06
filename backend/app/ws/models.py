@@ -102,6 +102,12 @@ class Settings:
     backfill_retry_base: float = field(
         default_factory=lambda: float(os.getenv("BACKFILL_RETRY_BASE", "0.5"))
     )
+    binance_api_key: Optional[str] = field(
+        default_factory=lambda: os.getenv("BINANCE_API_KEY")
+    )
+    binance_api_secret: Optional[str] = field(
+        default_factory=lambda: os.getenv("BINANCE_API_SECRET")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
