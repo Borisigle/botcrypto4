@@ -115,10 +115,21 @@ class BinanceHttpClient:
             params["recvWindow"] = 5000
             signature = self._sign_request(params)
             params["signature"] = signature
+            
+            # Debug logging for test mode
+            if self.settings.context_backfill_test_mode:
+                logger.info(f"HTTP Request: GET {url}")
+                logger.info(f"  Params: symbol={params['symbol']}, startTime={params['startTime']}, endTime={params['endTime']}, limit={params['limit']}")
+                logger.info(f"  Auth: timestamp={params['timestamp']}, recvWindow={params['recvWindow']}")
+                sig_preview = signature[:20] + "..." if len(signature) > 20 else signature
+                logger.info(f"  Signature: {sig_preview}")
         
         for attempt in range(self.max_retries):
             try:
                 async with self.session.get(url, params=params) as resp:
+                    if self.settings.context_backfill_test_mode:
+                        logger.info(f"HTTP Response: {resp.status} {resp.reason}")
+                        
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 401:
@@ -146,6 +157,18 @@ class BinanceHttpClient:
                             raise Exception(f"API access forbidden (403) after {self.max_retries} retries")
                     elif resp.status in {418, 429, 451}:
                         # Rate limited, blocked, or geographic restriction
+                        if self.settings.context_backfill_test_mode:
+                            # In test mode, log full response details for debugging
+                            logger.error(f"HTTP {resp.status} error in test mode!")
+                            logger.error(f"Response headers: {dict(resp.headers)}")
+                            try:
+                                error_text = await resp.text()
+                                logger.error(f"Response body: {error_text}")
+                            except:
+                                pass
+                            logger.error(f"Request URL: {url}")
+                            logger.error(f"Request params: {params}")
+                        
                         if attempt < self.max_retries - 1:
                             delay = self._exponential_backoff(attempt)
                             logger.warning(
@@ -157,6 +180,12 @@ class BinanceHttpClient:
                             raise Exception(f"Max retries exceeded for {url} (HTTP {resp.status})")
                     else:
                         logger.error(f"Unexpected status {resp.status}")
+                        if self.settings.context_backfill_test_mode:
+                            try:
+                                error_text = await resp.text()
+                                logger.error(f"Response body: {error_text}")
+                            except:
+                                pass
                         raise Exception(f"HTTP {resp.status}")
             except asyncio.TimeoutError:
                 if attempt < self.max_retries - 1:
@@ -204,13 +233,19 @@ class BinanceTradeHistory:
         self.request_delay = max(0.0, request_delay)
         self._max_retries = max(0, max_retries)
         self.chunk_minutes = max(1, chunk_minutes)
+        self.test_mode = settings.context_backfill_test_mode
         
         # Use higher concurrency when authentication is enabled
         api_key = settings.binance_api_key
         api_secret = settings.binance_api_secret
         use_auth = bool(api_key and api_secret)
         
-        if use_auth:
+        if self.test_mode:
+            # Test mode: single window, serial execution, detailed logging
+            self.max_concurrent_chunks = 1
+            self.request_delay = 0.0  # No delay needed for single request
+            logger.info("Backfill: TEST MODE - single window serial execution")
+        elif use_auth:
             # Aggressive parallelization with auth (higher rate limits)
             self.max_concurrent_chunks = 20
             self.request_delay = 0.0  # No delay needed with auth
@@ -223,7 +258,77 @@ class BinanceTradeHistory:
         self.max_iterations_per_chunk = max(1, max_iterations_per_chunk)
         self.http_client = BinanceHttpClient(settings)
 
+    async def test_single_window(self) -> List[TradeTick]:
+        """Test HMAC authentication with a single 1-hour window."""
+        from datetime import datetime, timezone
+        
+        # Test window: 2025-11-06T00:00:00 to 2025-11-06T01:00:00 UTC
+        start_dt = datetime(2025, 11, 6, 0, 0, 0, tzinfo=timezone.utc)
+        end_dt = datetime(2025, 11, 6, 1, 0, 0, tzinfo=timezone.utc)
+        start_ts = int(start_dt.timestamp() * 1000)
+        end_ts = int(end_dt.timestamp() * 1000)
+        
+        logger.info("=== HMAC AUTHENTICATION TEST MODE ===")
+        logger.info("Test mode: fetching single 1-hour window")
+        logger.info(f"  Window: {start_dt.isoformat()} to {end_dt.isoformat()}")
+        logger.info(f"  Timestamp: {start_ts} - {end_ts}")
+        
+        if self.http_client.use_auth:
+            # Log signature preview for debugging
+            test_params = {
+                "symbol": self.settings.symbol,
+                "startTime": start_ts,
+                "endTime": end_ts,
+                "limit": 1000,
+                "timestamp": int(time.time() * 1000),
+                "recvWindow": 5000
+            }
+            signature = self.http_client._sign_request(test_params)
+            sig_preview = signature[:20] + "..." if len(signature) > 20 else signature
+            logger.info(f"  Signature preview: {sig_preview}")
+        else:
+            logger.warning("  WARNING: No API credentials configured, using public endpoints")
+        
+        try:
+            trades = await self._fetch_trades_paginated(start_dt, end_dt)
+            logger.info(f"Test result: {len(trades)} trades loaded from test window")
+            
+            if trades:
+                # Calculate partial VWAP and POC for verification
+                vwap = sum(trade.price * trade.qty for trade in trades) / sum(trade.qty for trade in trades)
+                
+                # Calculate POC (Point of Control)
+                price_volumes = {}
+                for trade in trades:
+                    price_rounded = round(trade.price, 3)
+                    price_volumes[price_rounded] = price_volumes.get(price_rounded, 0) + trade.qty
+                
+                poc_price = max(price_volumes, key=price_volumes.get) if price_volumes else 0.0
+                
+                logger.info(f"VWAP (partial): {vwap:.2f}")
+                logger.info(f"POCd (partial): {poc_price:.2f}")
+                logger.info("✅ Success! HMAC authentication working correctly")
+                logger.info("Ready to expand to full backfill...")
+            else:
+                logger.warning("⚠️  No trades loaded - may indicate an issue")
+            
+            return trades
+            
+        except Exception as e:
+            logger.error(f"❌ Test failed: {e}")
+            if self.http_client.use_auth:
+                logger.error("Check your BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
+            raise
+
     async def iterate_trades(self, start: datetime, end: datetime) -> AsyncIterator[TradeTick]:
+        # If in test mode, ignore the provided start/end and use test window
+        if self.test_mode:
+            logger.info("Test mode active: using predefined 1-hour test window")
+            trades = await self.test_single_window()
+            for trade in trades:
+                yield trade
+            return
+        
         start_utc = self._ensure_utc(start)
         end_utc = self._ensure_utc(end)
         start_ms = int(start_utc.timestamp() * 1000)

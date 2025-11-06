@@ -416,6 +416,32 @@ class ContextService:
         if provider is None or not self.day_start:
             return False
 
+        # Check if we're in test mode
+        if hasattr(provider, 'test_mode') and provider.test_mode:
+            logger.info("=== BACKFILL TEST MODE DETECTED ===")
+            logger.info("Running authentication test instead of full backfill...")
+            
+            try:
+                # Test the authentication with single window
+                trades = await provider.test_single_window()
+                trade_count = len(trades)
+                
+                if trade_count > 0:
+                    logger.info(f"✅ Test successful! Loaded {trade_count} trades")
+                    logger.info("HMAC authentication verified - ready for production use")
+                    logger.info("To run full backfill, set CONTEXT_BACKFILL_TEST_MODE=false")
+                else:
+                    logger.warning("⚠️  Test completed but no trades loaded")
+                
+                # In test mode, we don't populate previous day levels
+                return False
+                
+            except Exception as exc:
+                logger.exception("❌ Authentication test failed")
+                logger.error("Check your BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
+                logger.error("To continue without authentication, unset both API_KEY and API_SECRET")
+                raise
+
         prev_levels_loaded = False
         day_start = self.day_start
 

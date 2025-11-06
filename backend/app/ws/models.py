@@ -93,6 +93,9 @@ class Settings:
     context_backfill_enabled: bool = field(
         default_factory=lambda: _env_bool("CONTEXT_BACKFILL_ENABLED", "true")
     )
+    context_backfill_test_mode: bool = field(
+        default_factory=lambda: _env_bool("CONTEXT_BACKFILL_TEST_MODE", "false")
+    )
     binance_api_timeout: int = field(
         default_factory=lambda: int(os.getenv("BINANCE_API_TIMEOUT", "30"))
     )
