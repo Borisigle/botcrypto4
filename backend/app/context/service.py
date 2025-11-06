@@ -470,15 +470,14 @@ class ContextService:
         end: datetime,
     ) -> int:
         trade_count = 0
-        progress_step = 50000
+        progress_step = 10000  # Log every 10,000 trades instead of 50,000
         async for trade in provider.iterate_trades(start, end):
             self.ingest_trade(trade)
             trade_count += 1
             if trade_count % progress_step == 0:
                 logger.info(
-                    "Backfill progress: trades=%d last_ts=%s",
+                    "Backfill progress: %d trades loaded",
                     trade_count,
-                    trade.ts.isoformat(),
                 )
         return trade_count
 
@@ -530,7 +529,7 @@ class ContextService:
         day_low: Optional[float] = None
         total_trades = 0
         total_volume = 0.0
-        progress_step = 50000
+        progress_step = 10000  # Log every 10,000 trades instead of 50,000
 
         async for trade in provider.iterate_trades(start, end):
             price = float(trade.price)
@@ -547,9 +546,8 @@ class ContextService:
                 day_low = price
             if total_trades % progress_step == 0:
                 logger.info(
-                    "Backfill previous day progress: trades=%d last_price=%s",
+                    "Backfill previous day progress: %d trades loaded",
                     total_trades,
-                    self._format_float(price),
                 )
 
         levels = self._profile_from_volume(dict(volume_map), day_high, day_low)
