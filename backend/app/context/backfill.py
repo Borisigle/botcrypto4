@@ -130,7 +130,7 @@ class BinanceTradeHistory:
         request_delay: float = 0.1,
         max_retries: int = 5,
         chunk_minutes: int = 10,
-        max_concurrent_chunks: int = 10,
+        max_concurrent_chunks: int = 5,
         max_iterations_per_chunk: int = 500,
     ) -> None:
         self.settings = settings
@@ -171,57 +171,83 @@ class BinanceTradeHistory:
             await self.http_client.close()
 
     async def _backfill_parallel(self, start_dt: datetime, end_dt: datetime) -> List[TradeTick]:
-        """Split time window into chunks and download in parallel."""
+        """Split time window into chunks and download in parallel with throttling."""
         import time
         start_time = time.time()
         
         chunks = self._split_time_range(start_dt, end_dt, self.chunk_minutes)
         
         logger.info(
-            "Backfill parallel: downloading %d chunks (%d min each) from %s to %s",
+            "Backfill: %d chunks (%d min each), max %d concurrent from %s to %s",
             len(chunks),
             self.chunk_minutes,
+            self.max_concurrent_chunks,
             start_dt.isoformat(),
             end_dt.isoformat(),
         )
         
         semaphore = asyncio.Semaphore(self.max_concurrent_chunks)
         
-        async def fetch_chunk(chunk_start: datetime, chunk_end: datetime) -> List[TradeTick]:
+        async def fetch_chunk_throttled(chunk_index: int, chunk_start: datetime, chunk_end: datetime) -> Tuple[int, List[TradeTick]]:
             async with semaphore:
+                # Add 50-100ms delay between fetches for gentle throttling
+                await asyncio.sleep(0.05 + (random.random() * 0.05))
                 try:
-                    return await self._fetch_trades_paginated(chunk_start, chunk_end)
+                    trades = await self._fetch_trades_paginated(chunk_start, chunk_end)
+                    return chunk_index, trades
                 except Exception as exc:
-                    logger.error(
-                        "Backfill chunk failed: %s to %s - error=%s",
+                    logger.warning(
+                        "Chunk %d failed: %s to %s - %s, continuing...",
+                        chunk_index,
                         chunk_start.isoformat(),
                         chunk_end.isoformat(),
                         exc,
                     )
-                    return []
+                    return chunk_index, []
         
-        # Download all chunks in parallel
-        tasks = [fetch_chunk(c_start, c_end) for c_start, c_end in chunks]
+        # Download all chunks in parallel with throttling
+        tasks = [fetch_chunk_throttled(i, c_start, c_end) for i, (c_start, c_end) in enumerate(chunks)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Flatten results and deduplicate by trade ID
         all_trades = []
         seen_ids = set()
-        total_chunks_successful = 0
+        successful_chunks = 0
+        failed_chunks = 0
         
         for result in results:
             if isinstance(result, Exception):
+                failed_chunks += 1
                 logger.error("Backfill chunk exception: %s", result)
                 continue
             
-            chunk_trades = result  # type: ignore
+            chunk_index, chunk_trades = result
             if chunk_trades:
-                total_chunks_successful += 1
+                successful_chunks += 1
+            else:
+                failed_chunks += 1
                 
             for trade in chunk_trades:
                 if trade.id not in seen_ids:
                     all_trades.append(trade)
                     seen_ids.add(trade.id)
+            
+            # Progress logging every 10 chunks
+            if (chunk_index + 1) % 10 == 0:
+                elapsed = time.time() - start_time
+                chunks_per_second = (chunk_index + 1) / elapsed
+                remaining_chunks = len(chunks) - (chunk_index + 1)
+                eta_seconds = remaining_chunks / chunks_per_second if chunks_per_second > 0 else 0
+                logger.info(
+                    "Progress: %d/%d chunks processed, ~%d trades, ~%.0fs remaining",
+                    chunk_index + 1,
+                    len(chunks),
+                    len(all_trades),
+                    eta_seconds,
+                )
+        
+        # Sort by timestamp to ensure chronological order
+        all_trades.sort(key=lambda t: t.ts)
         
         # Safety check: warn if too many trades for the window
         window_hours = (end_dt - start_dt).total_seconds() / 3600
@@ -233,17 +259,19 @@ class BinanceTradeHistory:
             )
         
         elapsed_time = time.time() - start_time
+        success_rate = (len(chunks) - failed_chunks) / len(chunks) * 100
         vwap = (
             sum(trade.price * trade.qty for trade in all_trades) / sum(trade.qty for trade in all_trades)
             if all_trades else 0.0
         )
         logger.info(
-            "Backfill complete: %d trades in %.2fs, VWAP=%.3f, %d/%d chunks successful",
+            "Backfill complete: %d trades in %.1fs, %.1f%% chunks successful (%d/%d), VWAP=%.3f",
             len(all_trades),
             elapsed_time,
-            vwap,
-            total_chunks_successful,
+            success_rate,
+            successful_chunks,
             len(chunks),
+            vwap,
         )
         
         return all_trades
