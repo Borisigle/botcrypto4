@@ -123,6 +123,12 @@ class Settings:
     backfill_public_delay_ms: int = field(
         default_factory=lambda: int(os.getenv("BACKFILL_PUBLIC_DELAY_MS", "100"))
     )
+    backfill_cache_enabled: bool = field(
+        default_factory=lambda: _env_bool("BACKFILL_CACHE_ENABLED", "true")
+    )
+    backfill_cache_dir: str = field(
+        default_factory=lambda: os.getenv("BACKFILL_CACHE_DIR", "./context_history_dir/backfill_cache")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
