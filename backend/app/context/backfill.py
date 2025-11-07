@@ -9,14 +9,16 @@ import hmac
 import hashlib
 from datetime import datetime, timezone, timedelta
 from enum import Enum
-from typing import AsyncIterator, Callable, Optional, Protocol, List, Tuple
+from typing import AsyncIterator, Callable, Optional, Protocol, List, Tuple, Dict, Any
 from urllib.parse import urlencode
+from pathlib import Path
 
 import aiohttp
 
 from app.ws.models import Settings, TradeTick
 from app.ws.trades import parse_trade_message
 from .price_bins import quantize_price_to_tick, get_effective_tick_size, validate_tick_size, PriceBinningError
+from .backfill_cache import BackfillCacheManager
 
 logger = logging.getLogger("context.backfill")
 
@@ -384,6 +386,12 @@ class BinanceTradeHistory:
             
         self.max_iterations_per_chunk = max(1, max_iterations_per_chunk)
         self.http_client = BinanceHttpClient(settings)
+        
+        # Initialize cache manager if caching is enabled
+        self.cache_enabled = settings.backfill_cache_enabled
+        self.cache_manager: Optional[BackfillCacheManager] = None
+        if self.cache_enabled:
+            self.cache_manager = BackfillCacheManager(settings.backfill_cache_dir)
 
     async def test_single_window(self) -> List[TradeTick]:
         """Test HMAC authentication with a single 1-hour window."""
@@ -452,6 +460,135 @@ class BinanceTradeHistory:
             if self.http_client.use_auth:
                 logger.error("Check your BINANCE_API_KEY and BINANCE_API_SECRET environment variables")
             raise
+
+    async def backfill_with_cache(self, start_dt: datetime, end_dt: datetime) -> List[TradeTick]:
+        """Backfill with smart cache resume strategy.
+        
+        Checks for existing cache and only downloads new data since last cached timestamp.
+        Falls back to full backfill if no cache exists.
+        
+        Args:
+            start_dt: Start datetime (should be day start, e.g., 00:00 UTC).
+            end_dt: End datetime (current time).
+            
+        Returns:
+            List of deduplicated trades sorted by timestamp.
+        """
+        if not self.cache_manager:
+            # Caching disabled, do full backfill
+            logger.info("Backfill cache: disabled")
+            return await self._backfill_parallel(start_dt, end_dt)
+        
+        today = start_dt.date()
+        cache_path = self.cache_manager.get_cache_path(start_dt)
+        
+        # Try to load cached trades
+        cached_trades_dicts = self.cache_manager.load_cached_trades(start_dt)
+        
+        if cached_trades_dicts:
+            # Cache hit - determine if we need to download new data
+            logger.info(f"Cache found: {len(cached_trades_dicts)} trades from {today.isoformat()}")
+            
+            # Convert dict trades back to TradeTick objects
+            cached_trades = self._dicts_to_trade_ticks(cached_trades_dicts)
+            
+            # Get the last cached timestamp
+            last_cached_ts_ms = self.cache_manager.get_last_cached_timestamp(cached_trades_dicts)
+            
+            if last_cached_ts_ms is None:
+                logger.warning("Could not extract timestamp from cached trades, using cache as-is")
+                return cached_trades
+            
+            # Convert milliseconds to datetime
+            last_cached_dt = datetime.fromtimestamp(last_cached_ts_ms / 1000, tz=timezone.utc)
+            
+            # Calculate gap since last cache
+            gap_hours = (end_dt - last_cached_dt).total_seconds() / 3600
+            
+            if gap_hours <= 0:
+                logger.info(f"Cache is fresh (< 1h old, gap: {gap_hours:.1f}h), using as-is")
+                return cached_trades
+            else:
+                logger.info(f"Gap detected: {gap_hours:.1f}h since last cache. Downloading new data...")
+                
+                # Download new data from last cached time to end_dt
+                # Add 1ms buffer to avoid re-downloading the last cached trade
+                new_start_dt = datetime.fromtimestamp(
+                    (last_cached_ts_ms + 1) / 1000, tz=timezone.utc
+                )
+                
+                # Only download if there's a gap
+                if new_start_dt < end_dt:
+                    new_trades = await self._backfill_parallel(new_start_dt, end_dt)
+                    
+                    # Merge old and new trades
+                    all_trades_list = [
+                        self._trade_tick_to_dict(t) for t in cached_trades
+                    ] + [
+                        self._trade_tick_to_dict(t) for t in new_trades
+                    ]
+                    
+                    # Deduplicate
+                    all_trades_list = self.cache_manager.deduplicate_trades(all_trades_list)
+                    
+                    # Convert back to TradeTick
+                    all_trades = self._dicts_to_trade_ticks(all_trades_list)
+                    
+                    logger.info(
+                        f"Downloaded {len(new_trades)} new trades, "
+                        f"merged with {len(cached_trades)} cached trades, "
+                        f"total: {len(all_trades)} after dedup"
+                    )
+                else:
+                    logger.info("No gap to fill, using cached data")
+                    all_trades = cached_trades
+        else:
+            # No cache - do full backfill
+            logger.info(f"No cache for {today.isoformat()}, doing full backfill")
+            all_trades = await self._backfill_parallel(start_dt, end_dt)
+        
+        # Save to cache (always update to include latest data)
+        all_trades_dicts = [self._trade_tick_to_dict(t) for t in all_trades]
+        self.cache_manager.save_trades_to_cache(all_trades_dicts, start_dt)
+        
+        return all_trades
+
+    def _trade_tick_to_dict(self, trade: TradeTick) -> Dict[str, Any]:
+        """Convert TradeTick object to dictionary for cache storage."""
+        return {
+            "T": int(trade.ts.timestamp() * 1000),  # timestamp in milliseconds
+            "a": trade.id,  # aggTradeId
+            "p": float(trade.price),  # price
+            "q": float(trade.qty),  # qty
+            "f": 0,  # firstTradeId (not available, use 0)
+            "l": 0,  # lastTradeId (not available, use 0)
+            "m": trade.isBuyerMaker,  # isBuyerMaker
+            "M": True,  # ignore (not used)
+        }
+
+    def _dicts_to_trade_ticks(self, trades_dicts: List[Dict[str, Any]]) -> List[TradeTick]:
+        """Convert dictionary trades to TradeTick objects."""
+        trades = []
+        for trade_dict in trades_dicts:
+            try:
+                # Map dict fields to TradeTick
+                ts_ms = trade_dict.get("T", 0)
+                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                
+                tick = TradeTick(
+                    ts=ts,
+                    price=float(trade_dict.get("p", 0)),
+                    qty=float(trade_dict.get("q", 0)),
+                    side="buy" if not trade_dict.get("m") else "sell",  # isBuyerMaker reversed
+                    isBuyerMaker=bool(trade_dict.get("m", False)),
+                    id=int(trade_dict.get("a", 0)),  # aggTradeId as id
+                )
+                trades.append(tick)
+            except Exception as e:
+                logger.warning(f"Failed to convert trade dict: {e}, skipping")
+                continue
+        
+        return trades
 
     async def iterate_trades(self, start: datetime, end: datetime) -> AsyncIterator[TradeTick]:
         # If in test mode, ignore the provided start/end and use test window

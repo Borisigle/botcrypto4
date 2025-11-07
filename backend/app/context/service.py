@@ -456,13 +456,37 @@ class ContextService:
         if now > day_start:
             start_iso = day_start.isoformat()
             end_iso = now.isoformat()
-            logger.info(
-                "Backfill: downloading trades from %s to %s",
-                start_iso,
-                end_iso,
+            
+            # Check if we should use cache-aware backfill
+            use_cache = (
+                hasattr(provider, 'backfill_with_cache') and
+                hasattr(provider, 'cache_enabled') and
+                provider.cache_enabled
             )
+            
+            if use_cache:
+                logger.info(
+                    "Backfill: using cache + resume strategy from %s to %s",
+                    start_iso,
+                    end_iso,
+                )
+            else:
+                logger.info(
+                    "Backfill: downloading trades from %s to %s",
+                    start_iso,
+                    end_iso,
+                )
+            
             try:
-                trade_count = await self._ingest_historical_trades(provider, day_start, now)
+                if use_cache:
+                    # Use cache-aware backfill
+                    trades = await provider.backfill_with_cache(day_start, now)
+                    trade_count = len(trades)
+                    for trade in trades:
+                        self.ingest_trade(trade)
+                else:
+                    # Use traditional backfill
+                    trade_count = await self._ingest_historical_trades(provider, day_start, now)
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.exception(
                     "backfill_today_failed",
