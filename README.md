@@ -48,7 +48,17 @@ This repository provides a minimal monorepo scaffold featuring a Next.js 14 fron
 │   ├── Dockerfile
 │   ├── app
 │   │   ├── __init__.py
-│   │   └── main.py
+│   │   ├── main.py
+│   │   ├── context/          # Context service for market metrics
+│   │   ├── strategy/         # Strategy framework for trading analysis
+│   │   │   ├── engine.py     # Main strategy orchestrator
+│   │   │   ├── scheduler.py  # Session management (London/Overlap)
+│   │   │   ├── models.py     # Data models and enums
+│   │   │   ├── routes.py     # FastAPI endpoints
+│   │   │   └── analyzers/    # Market regime detection
+│   │   │       └── context.py
+│   │   ├── tests/            # Test suite
+│   │   └── ws/              # WebSocket data ingestion
 │   ├── .env.example
 │   └── requirements.txt
 ├── frontend
@@ -89,6 +99,26 @@ source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+## Strategy Framework
+
+The backend includes a comprehensive strategy framework for real-time trading analysis:
+
+### Key Features
+- **Session Management**: London (08:00-12:00 UTC) and NY overlap (13:00-17:00 UTC) trading sessions
+- **Real-time Candle Aggregation**: Configurable timeframes (1m, 5m) from live trade data
+- **Market Regime Detection**: Context analyzer classifies range vs trend markets
+- **Event System**: Pub/sub interface for strategy components
+- **REST API**: Endpoints for strategy status, candles, and analysis diagnostics
+
+### API Endpoints
+- `/strategy/status` - Current strategy engine state and market analysis
+- `/strategy/candles` - Historical candle data by timeframe
+- `/strategy/analysis/diagnostics` - Detailed market regime diagnostics
+- `/context` - Live market context metrics (VWAP, POC, volume profile)
+- `/ws/health` - WebSocket stream health status
+
+For detailed documentation, see `backend/app/strategy/README.md`.
 
 ## Stopping & Logs
 
