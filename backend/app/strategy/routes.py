@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from .analyzers.context import get_context_analyzer
+from .analyzers.orderflow import get_orderflow_analyzer
 from .engine import get_strategy_engine
 
 router = APIRouter()
@@ -56,3 +57,20 @@ async def get_analysis_diagnostics():
     """Get detailed diagnostics from the context analyzer."""
     analyzer = get_context_analyzer()
     return analyzer.get_diagnostics()
+
+
+@router.get("/strategy/metrics")
+async def get_metrics():
+    """Get latest market metrics from order flow analyzer.
+
+    Returns metrics including:
+    - vwap: Volume-weighted average price
+    - poc: Point of control
+    - delta: Cumulative delta (buy_vol - sell_vol)
+    - buy_volume: Total buy volume
+    - sell_volume: Total sell volume
+    - footprint: Top 20 price bins by volume
+    - trade_count: Number of trades processed
+    """
+    analyzer = get_orderflow_analyzer()
+    return analyzer.get_metrics_with_metadata()
