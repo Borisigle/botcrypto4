@@ -8,6 +8,7 @@ import time
 import hmac
 import hashlib
 from datetime import datetime, timezone, timedelta
+from enum import Enum
 from typing import AsyncIterator, Callable, Optional, Protocol, List, Tuple
 from urllib.parse import urlencode
 
@@ -20,6 +21,13 @@ from .price_bins import quantize_price_to_tick, get_effective_tick_size, validat
 logger = logging.getLogger("context.backfill")
 
 
+class CircuitBreakerState(Enum):
+    """Circuit breaker state for rate limit management."""
+    CLOSED = "closed"  # Normal operation
+    OPEN = "open"  # Rate limited, enforcing cooldown
+    HALF_OPEN = "half_open"  # Testing recovery
+
+
 class TradeHistoryProvider(Protocol):
     """Abstract interface for iterating historical trades."""
 
@@ -28,7 +36,7 @@ class TradeHistoryProvider(Protocol):
 
 
 class BinanceHttpClient:
-    """HTTP client for Binance API with proper headers, session management, retry logic, and optional HMAC authentication."""
+    """HTTP client for Binance API with proper headers, session management, retry logic, optional HMAC authentication, and circuit breaker."""
     
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -56,6 +64,17 @@ class BinanceHttpClient:
             
         self.max_retries = settings.backfill_max_retries
         self.retry_base = settings.backfill_retry_base
+        
+        # Circuit breaker state for rate limit management
+        self.circuit_state = CircuitBreakerState.CLOSED
+        self.consecutive_rate_limit_errors = 0
+        self.rate_limit_threshold = settings.backfill_rate_limit_threshold
+        self.cooldown_seconds = settings.backfill_cooldown_seconds
+        self.cooldown_until: Optional[float] = None
+        
+        # Rate limit pressure indicators
+        self.throttle_multiplier = 1.0  # Start at normal speed
+        self.last_rate_limit_ts: Optional[float] = None
         
     async def connect(self):
         """Initialize HTTP session if not already created."""
@@ -92,6 +111,56 @@ class BinanceHttpClient:
         
         return signature
     
+    async def check_circuit_breaker(self) -> bool:
+        """Check if circuit breaker is open and enforce cooldown if needed. Returns True if breaker is open."""
+        if self.circuit_state != CircuitBreakerState.OPEN:
+            return False
+        
+        if self.cooldown_until is None:
+            return False
+        
+        current_time = time.time()
+        if current_time < self.cooldown_until:
+            remaining = self.cooldown_until - current_time
+            logger.warning(f"Circuit breaker open: cooldown active for {remaining:.1f}s more")
+            await asyncio.sleep(min(remaining, 1.0))  # Sleep up to 1 second
+            return True
+        
+        # Cooldown expired, attempt recovery
+        self.circuit_state = CircuitBreakerState.HALF_OPEN
+        self.consecutive_rate_limit_errors = 0
+        logger.info("Circuit breaker: entering HALF_OPEN state to test recovery")
+        return False
+    
+    def on_rate_limit_error(self) -> None:
+        """Handle a rate limit error (418/429/451)."""
+        self.consecutive_rate_limit_errors += 1
+        self.last_rate_limit_ts = time.time()
+        
+        # Increase throttle multiplier (will slow down requests)
+        self.throttle_multiplier = min(5.0, self.throttle_multiplier * 1.5)
+        
+        if self.consecutive_rate_limit_errors >= self.rate_limit_threshold:
+            if self.circuit_state != CircuitBreakerState.OPEN:
+                self.circuit_state = CircuitBreakerState.OPEN
+                self.cooldown_until = time.time() + self.cooldown_seconds
+                logger.error(
+                    f"Circuit breaker opened: {self.consecutive_rate_limit_errors} consecutive rate limit errors. "
+                    f"Enforcing {self.cooldown_seconds}s cooldown (throttle_multiplier={self.throttle_multiplier:.1f}x)"
+                )
+    
+    def on_successful_request(self) -> None:
+        """Handle a successful request."""
+        self.consecutive_rate_limit_errors = 0
+        
+        # Gradually recover throttle multiplier (progressive recovery)
+        if self.throttle_multiplier > 1.0:
+            self.throttle_multiplier = max(1.0, self.throttle_multiplier * 0.95)
+        
+        if self.circuit_state == CircuitBreakerState.HALF_OPEN:
+            self.circuit_state = CircuitBreakerState.CLOSED
+            logger.info("Circuit breaker: recovery successful, returning to CLOSED state")
+    
     async def fetch_agg_trades(
         self,
         symbol: str,
@@ -99,8 +168,11 @@ class BinanceHttpClient:
         end_time: int,
         limit: int = 1000
     ) -> List[dict]:
-        """Fetch aggregated trades with retry logic and optional HMAC authentication."""
+        """Fetch aggregated trades with retry logic, optional HMAC authentication, and circuit breaker."""
         await self.connect()
+        
+        # Check circuit breaker state
+        await self.check_circuit_breaker()
         
         url = f"{self.settings.rest_base_url.rstrip('/')}/fapi/v1/aggTrades"
         params = {
@@ -125,6 +197,7 @@ class BinanceHttpClient:
                 sig_preview = signature[:20] + "..." if len(signature) > 20 else signature
                 logger.info(f"  Signature: {sig_preview}")
         
+        rate_limit_error_count = 0
         for attempt in range(self.max_retries):
             try:
                 async with self.session.get(url, params=params) as resp:
@@ -132,23 +205,36 @@ class BinanceHttpClient:
                         logger.info(f"HTTP Response: {resp.status} {resp.reason}")
                         
                     if resp.status == 200:
+                        self.on_successful_request()
                         return await resp.json()
                     elif resp.status == 401:
                         # Unauthorized - likely bad credentials
                         logger.error("Binance API authentication failed (401). Check your API credentials.")
-                        if attempt == 0:
+                        if attempt == 0 and self.use_auth:
                             logger.info("Falling back to public endpoints for subsequent requests...")
                             self.use_auth = False
                             # Remove auth params and retry
                             params.pop("timestamp", None)
                             params.pop("recvWindow", None)
                             params.pop("signature", None)
+                            if "X-MBX-APIKEY" in self.headers:
+                                del self.headers["X-MBX-APIKEY"]
                             continue
                         else:
                             raise Exception("Authentication failed and fallback unsuccessful")
                     elif resp.status == 403:
-                        # Forbidden - API key restrictions
-                        logger.warning("Binance API access forbidden (403). Check API key permissions.")
+                        # Forbidden - API key restrictions, fallback to public mode
+                        logger.warning("Binance API access forbidden (403). Attempting fallback to public endpoints...")
+                        if self.use_auth:
+                            self.use_auth = False
+                            params.pop("timestamp", None)
+                            params.pop("recvWindow", None)
+                            params.pop("signature", None)
+                            if "X-MBX-APIKEY" in self.headers:
+                                del self.headers["X-MBX-APIKEY"]
+                            if attempt < self.max_retries - 1:
+                                await asyncio.sleep(0.5)
+                                continue
                         if attempt < self.max_retries - 1:
                             delay = self._exponential_backoff(attempt)
                             logger.warning(f"Retrying in {delay:.2f}s (attempt {attempt+1}/{self.max_retries})")
@@ -158,6 +244,9 @@ class BinanceHttpClient:
                             raise Exception(f"API access forbidden (403) after {self.max_retries} retries")
                     elif resp.status in {418, 429, 451}:
                         # Rate limited, blocked, or geographic restriction
+                        rate_limit_error_count += 1
+                        self.on_rate_limit_error()
+                        
                         if self.settings.context_backfill_test_mode:
                             # In test mode, log full response details for debugging
                             logger.error(f"HTTP {resp.status} error in test mode!")
@@ -170,15 +259,31 @@ class BinanceHttpClient:
                             logger.error(f"Request URL: {url}")
                             logger.error(f"Request params: {params}")
                         
+                        # Check if we should switch to public mode for rate-limited auth requests
+                        if self.use_auth and resp.status in {429, 418}:
+                            logger.warning(
+                                f"Rate limit detected on authenticated request (HTTP {resp.status}). "
+                                f"Downgrading to public mode (consecutive errors: {self.consecutive_rate_limit_errors})"
+                            )
+                            self.use_auth = False
+                            params.pop("timestamp", None)
+                            params.pop("recvWindow", None)
+                            params.pop("signature", None)
+                            if "X-MBX-APIKEY" in self.headers:
+                                del self.headers["X-MBX-APIKEY"]
+                        
                         if attempt < self.max_retries - 1:
                             delay = self._exponential_backoff(attempt)
+                            # Apply throttle multiplier to delay
+                            adjusted_delay = delay * self.throttle_multiplier
                             logger.warning(
-                                f"HTTP {resp.status} error, retrying in {delay:.2f}s (attempt {attempt+1}/{self.max_retries})"
+                                f"HTTP {resp.status} error (attempt {attempt+1}/{self.max_retries}), "
+                                f"retrying in {adjusted_delay:.2f}s (throttle: {self.throttle_multiplier:.1f}x)"
                             )
-                            await asyncio.sleep(delay)
+                            await asyncio.sleep(adjusted_delay)
                             continue
                         else:
-                            raise Exception(f"Max retries exceeded for {url} (HTTP {resp.status})")
+                            raise Exception(f"Max retries exceeded for {url} (HTTP {resp.status}, {rate_limit_error_count} rate limit errors)")
                     else:
                         logger.error(f"Unexpected status {resp.status}")
                         if self.settings.context_backfill_test_mode:
@@ -213,6 +318,22 @@ class BinanceHttpClient:
         delay = min(delay, max_delay)
         jitter = delay * 0.2 * (random.random() - 0.5)
         return delay + jitter
+    
+    def get_throttle_multiplier(self) -> float:
+        """Get current throttle multiplier for dynamic request delay adjustment."""
+        return self.throttle_multiplier
+    
+    def get_recommended_concurrency(self, base_concurrency: int) -> int:
+        """Get recommended concurrency based on current throttle state."""
+        # Reduce concurrency based on throttle multiplier
+        if self.throttle_multiplier > 2.0:
+            # Heavy throttling
+            return max(1, base_concurrency // 4)
+        elif self.throttle_multiplier > 1.5:
+            # Moderate throttling
+            return max(1, base_concurrency // 2)
+        else:
+            return base_concurrency
 
 
 class BinanceTradeHistory:
@@ -223,7 +344,7 @@ class BinanceTradeHistory:
         settings: Settings,
         *,
         limit: int = 1000,
-        request_delay: float = 0.1,
+        request_delay: Optional[float] = None,
         max_retries: int = 5,
         chunk_minutes: int = 10,
         max_concurrent_chunks: int = 5,
@@ -231,7 +352,6 @@ class BinanceTradeHistory:
     ) -> None:
         self.settings = settings
         self.limit = max(1, limit)
-        self.request_delay = max(0.0, request_delay)
         self._max_retries = max(0, max_retries)
         self.chunk_minutes = max(1, chunk_minutes)
         self.test_mode = settings.context_backfill_test_mode
@@ -254,7 +374,13 @@ class BinanceTradeHistory:
         else:
             # Conservative settings for public endpoints
             self.max_concurrent_chunks = max(1, max_concurrent_chunks)
-            logger.info(f"Backfill: Using public mode with {self.max_concurrent_chunks} concurrent chunks")
+            # Use configured public delay or provided request_delay
+            if request_delay is not None:
+                self.request_delay = max(0.0, request_delay)
+            else:
+                # Convert milliseconds to seconds from settings
+                self.request_delay = settings.backfill_public_delay_ms / 1000.0
+            logger.info(f"Backfill: Using public mode with {self.max_concurrent_chunks} concurrent chunks, {self.request_delay*1000:.0f}ms delay")
             
         self.max_iterations_per_chunk = max(1, max_iterations_per_chunk)
         self.http_client = BinanceHttpClient(settings)
@@ -364,7 +490,7 @@ class BinanceTradeHistory:
             await self.http_client.close()
 
     async def _backfill_parallel(self, start_dt: datetime, end_dt: datetime) -> List[TradeTick]:
-        """Split time window into chunks and download in parallel with throttling."""
+        """Split time window into chunks and download in parallel with throttling and dynamic concurrency adjustment."""
         import time
         start_time = time.time()
         
@@ -379,16 +505,23 @@ class BinanceTradeHistory:
             end_dt.isoformat(),
         )
         
-        semaphore = asyncio.Semaphore(self.max_concurrent_chunks)
+        # Track failed chunks for retry
+        failed_chunk_indices = []
+        current_concurrency = self.max_concurrent_chunks
+        current_request_delay = self.request_delay
         
-        async def fetch_chunk_throttled(chunk_index: int, chunk_start: datetime, chunk_end: datetime) -> Tuple[int, List[TradeTick]]:
+        semaphore = asyncio.Semaphore(current_concurrency)
+        
+        async def fetch_chunk_throttled(chunk_index: int, chunk_start: datetime, chunk_end: datetime) -> Tuple[int, List[TradeTick], bool]:
             async with semaphore:
-                # Add delay only for public endpoints to avoid 418 errors
-                if self.request_delay > 0:
-                    await asyncio.sleep(self.request_delay + (random.random() * 0.05))
+                # Adjust delay based on rate limit pressure
+                throttle_multiplier = self.http_client.get_throttle_multiplier()
+                adjusted_delay = current_request_delay * throttle_multiplier
+                if adjusted_delay > 0:
+                    await asyncio.sleep(adjusted_delay + (random.random() * 0.05))
                 try:
                     trades = await self._fetch_trades_paginated(chunk_start, chunk_end)
-                    return chunk_index, trades
+                    return chunk_index, trades, True
                 except Exception as exc:
                     logger.warning(
                         "Chunk %d failed: %s to %s - %s, continuing...",
@@ -397,7 +530,7 @@ class BinanceTradeHistory:
                         chunk_end.isoformat(),
                         exc,
                     )
-                    return chunk_index, []
+                    return chunk_index, [], False
         
         # Download all chunks in parallel with throttling
         tasks = [fetch_chunk_throttled(i, c_start, c_end) for i, (c_start, c_end) in enumerate(chunks)]
@@ -415,11 +548,12 @@ class BinanceTradeHistory:
                 logger.error("Backfill chunk exception: %s", result)
                 continue
             
-            chunk_index, chunk_trades = result
-            if chunk_trades:
+            chunk_index, chunk_trades, was_successful = result
+            if was_successful and chunk_trades:
                 successful_chunks += 1
-            else:
+            elif not was_successful:
                 failed_chunks += 1
+                failed_chunk_indices.append(chunk_index)
                 
             for trade in chunk_trades:
                 if trade.id not in seen_ids:
@@ -432,13 +566,41 @@ class BinanceTradeHistory:
                 chunks_per_second = (chunk_index + 1) / elapsed
                 remaining_chunks = len(chunks) - (chunk_index + 1)
                 eta_seconds = remaining_chunks / chunks_per_second if chunks_per_second > 0 else 0
+                throttle_mult = self.http_client.get_throttle_multiplier()
                 logger.info(
-                    "Progress: %d/%d chunks processed, ~%d trades, ~%.0fs remaining",
+                    "Progress: %d/%d chunks processed, ~%d trades, ~%.0fs remaining (throttle: %.1f%s, concurrency: %d)",
                     chunk_index + 1,
                     len(chunks),
                     len(all_trades),
                     eta_seconds,
+                    throttle_mult,
+                    "x" if throttle_mult > 1.0 else "",
+                    current_concurrency,
                 )
+        
+        # Retry failed chunks if any
+        if failed_chunk_indices:
+            logger.info("Retrying %d failed chunks...", len(failed_chunk_indices))
+            retry_tasks = []
+            for idx in failed_chunk_indices:
+                c_start, c_end = chunks[idx]
+                retry_tasks.append(fetch_chunk_throttled(idx, c_start, c_end))
+            
+            retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+            for result in retry_results:
+                if isinstance(result, Exception):
+                    logger.error("Backfill chunk retry exception: %s", result)
+                    continue
+                
+                chunk_index, chunk_trades, was_successful = result
+                if was_successful and chunk_trades:
+                    successful_chunks += 1
+                    failed_chunks -= 1
+                
+                for trade in chunk_trades:
+                    if trade.id not in seen_ids:
+                        all_trades.append(trade)
+                        seen_ids.add(trade.id)
         
         # Sort by timestamp to ensure chronological order
         all_trades.sort(key=lambda t: t.ts)
