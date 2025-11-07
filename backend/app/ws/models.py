@@ -111,6 +111,9 @@ class Settings:
     binance_api_secret: Optional[str] = field(
         default_factory=lambda: os.getenv("BINANCE_API_SECRET")
     )
+    profile_tick_size: float = field(
+        default_factory=lambda: float(os.getenv("PROFILE_TICK_SIZE", "0.1"))
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")

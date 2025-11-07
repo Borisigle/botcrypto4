@@ -11,7 +11,23 @@ On service startup the backend queries `fapi/v1/exchangeInfo` from the Binance F
 - **minQty** – minimum order size
 - **minNotional** – minimum notional value when available
 
-The parsed payload is logged once on startup and exposed through `GET /debug/exchangeinfo` for verification. When the fetch fails the service keeps running but falls back to the legacy per-price binning.
+The parsed payload is logged once on startup and exposed through `GET /debug/exchangeinfo` for verification. When the fetch fails the service continues running using a configurable fallback tick size.
+
+### Price binning utility
+
+The service now uses a shared price binning utility (`backend/app/context/price_bins.py`) that provides:
+
+- **Precise Decimal math**: Eliminates floating-point drift in price quantization
+- **Tick-size validation**: Ensures tick sizes are reasonable for crypto markets
+- **Configurable fallback**: Uses `PROFILE_TICK_SIZE` environment variable when exchange info is unavailable
+- **Consistent binning**: Same logic applied to live ingestion and backfill modes
+
+The `quantize_price_to_tick()` function implements floor rounding to match TradingView's volume profile behavior.
+
+### Environment variables
+
+- `PROFILE_TICK_SIZE` – Fallback tick size when exchange info fails (default: 0.1)
+- `SYMBOL` – Trading symbol (default: BTCUSDT)
 
 ## Session boundaries
 
@@ -33,15 +49,24 @@ The in-memory checkpoint (`GET /debug/vwap`) exposes `sum_price_qty`, `sum_qty`,
 
 ## POC calculation
 
-POC is derived from a volume profile built with the exchange `tickSize`.
+POC is derived from a volume profile built with the exchange `tickSize` using the shared price binning utility.
 
-1. For each trade we snap the execution price down to the nearest tick-size bin using floor rounding.
-2. We accumulate base volume (BTC) per bin.
+1. For each trade we snap the execution price down to the nearest tick-size bin using `quantize_price_to_tick()`
+2. We accumulate base volume (BTC) per bin using precise Decimal arithmetic
 3. The **POC** is the bin with the largest total volume. Ties are broken by selecting the lower price.
 4. The top ten bins are kept in memory and exposed via `GET /debug/poc` (sorted by descending volume, then ascending price).
 5. Value Area metrics reuse the binned profile and select prices until 70 % of the total volume is covered.
 
 When historical data is bootstrapped the same binning logic is applied, ensuring the previous-day levels line up with live calculations.
+
+### Fallback behavior
+
+If exchange info fetching fails or returns invalid tick sizes:
+
+1. The service logs a warning and falls back to `PROFILE_TICK_SIZE` (default: 0.1)
+2. All price binning continues using the fallback tick size
+3. The service remains operational and provides consistent results
+4. Debug endpoints show the effective tick size being used
 
 ## API surface
 
@@ -63,6 +88,38 @@ To reproduce TradingView values use the following chart configuration:
 - VWAP: anchored daily at `00:00 UTC`, volume source set to **Base/Quantity**
 - Volume Profile: Session mode, Volume (not TPO), row size = tick size (0.1 at the time of writing)
 
+### Reconciliation checklist
+
+When comparing backend POC values with TradingView:
+
+1. **Verify tick size alignment**: Ensure both systems use the same tick size
+   - Check `GET /debug/exchangeinfo` for the backend tick size
+   - Verify TradingView row size matches the exchange tickSize
+
+2. **Check fallback usage**: If exchange info failed, ensure `PROFILE_TICK_SIZE` matches TradingView row size
+
+3. **Validate price binning**: Test with synthetic data to confirm binning behavior:
+   ```python
+   # Example: 101.505 should bin to 101.5 with tickSize=0.1
+   from app.context.price_bins import quantize_price_to_tick
+   quantize_price_to_tick(101.505, 0.1)  # Should return 101.5
+   ```
+
+4. **Tie-breaking verification**: Ensure ties are resolved by selecting the lower price
+
+5. **Volume source confirmation**: Both systems should use base volume (BTC) for POC calculation
+
+### Expected precision
+
 Comparing the TradingView overlay with `/debug/vwap` and `/debug/poc` at the same timestamp should result in discrepancies smaller than ±0.05 % when using the same anchor and inputs. Remaining deviations should be logged alongside the collected debug payload when investigated.
 
 If future audits identify persistent differences linked to volume source selection, switch `/context?vwap_mode=quote` to validate the quote-based calculation. Any systematic gap that remains after matching tick size, anchor, and volume definition should be documented with the observed root cause and mitigation plan.
+
+### Troubleshooting common discrepancies
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| POC differs by exactly one tick size | Different rounding modes or tie-breaking | Verify floor rounding is used in both systems |
+| POC differs by multiple tick sizes | Different tick size configuration | Check exchange info vs TradingView row size |
+| Inconsistent results across restarts | Floating-point drift | Ensure Decimal math is used (shared utility) |
+| Large discrepancies | Different volume source or time window | Verify both use base volume and same session boundaries |

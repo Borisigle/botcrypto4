@@ -15,6 +15,7 @@ import aiohttp
 
 from app.ws.models import Settings, TradeTick
 from app.ws.trades import parse_trade_message
+from .price_bins import quantize_price_to_tick, get_effective_tick_size, validate_tick_size, PriceBinningError
 
 logger = logging.getLogger("context.backfill")
 
@@ -297,11 +298,17 @@ class BinanceTradeHistory:
                 # Calculate partial VWAP and POC for verification
                 vwap = sum(trade.price * trade.qty for trade in trades) / sum(trade.qty for trade in trades)
                 
-                # Calculate POC (Point of Control)
+                # Calculate POC (Point of Control) using proper price binning
                 price_volumes = {}
                 for trade in trades:
-                    price_rounded = round(trade.price, 3)
-                    price_volumes[price_rounded] = price_volumes.get(price_rounded, 0) + trade.qty
+                    # Use proper tick size binning instead of round(..., 3)
+                    price_binned = quantize_price_to_tick(
+                        trade.price,
+                        None,  # We don't have exchange info in test mode
+                        self.settings.profile_tick_size,
+                        self.settings.symbol,
+                    )
+                    price_volumes[price_binned] = price_volumes.get(price_binned, 0) + trade.qty
                 
                 poc_price = max(price_volumes, key=price_volumes.get) if price_volumes else 0.0
                 
@@ -457,11 +464,17 @@ class BinanceTradeHistory:
         # Calculate POC (Point of Control - price level with maximum volume)
         poc_price = 0.0
         if all_trades:
-            # Group trades by price level (rounded to 3 decimal places for BTCUSDT)
+            # Group trades by price level using proper tick size binning
             price_volumes = {}
             for trade in all_trades:
-                price_rounded = round(trade.price, 3)
-                price_volumes[price_rounded] = price_volumes.get(price_rounded, 0) + trade.qty
+                # Use proper tick size binning instead of round(..., 3)
+                price_binned = quantize_price_to_tick(
+                    trade.price,
+                    None,  # We don't have exchange info in backfill
+                    self.settings.profile_tick_size,
+                    self.settings.symbol,
+                )
+                price_volumes[price_binned] = price_volumes.get(price_binned, 0) + trade.qty
             
             # Find price with maximum volume
             if price_volumes:
