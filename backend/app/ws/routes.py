@@ -31,6 +31,12 @@ class WSModule:
             context_service=self.context_service,
         )
         self.depth_stream = DepthStream(self.settings, self.metrics)
+        self._strategy_engine = None
+
+    def set_strategy_engine(self, strategy_engine) -> None:
+        """Set the strategy engine reference for trade forwarding."""
+        self._strategy_engine = strategy_engine
+        self.trade_stream.set_strategy_engine(strategy_engine)
 
     async def startup(self) -> None:
         await self.trade_stream.start()
