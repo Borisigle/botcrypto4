@@ -1,0 +1,246 @@
+"""Tests for OrderFlowAnalyzer."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+
+from app.strategy.analyzers.orderflow import OrderFlowAnalyzer, get_orderflow_analyzer
+from app.strategy.metrics import MetricsCalculator
+from app.ws.models import Settings, TradeSide, TradeTick
+
+
+def _make_trade(
+    ts: datetime,
+    price: float,
+    qty: float,
+    side: TradeSide,
+    trade_id: int,
+) -> TradeTick:
+    """Create a TradeTick for testing."""
+    return TradeTick(
+        ts=ts,
+        price=price,
+        qty=qty,
+        side=side,
+        isBuyerMaker=side == TradeSide.SELL,
+        id=trade_id,
+    )
+
+
+class TestOrderFlowAnalyzer:
+    """Test OrderFlowAnalyzer functionality."""
+
+    def test_initialization(self):
+        """Test OrderFlowAnalyzer initialization."""
+        analyzer = OrderFlowAnalyzer()
+        assert analyzer.calculation_interval == 50
+        assert analyzer._trades_buffer == []
+        assert analyzer._latest_metrics is None
+
+    def test_ingest_single_trade(self):
+        """Test ingesting a single trade."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=100)
+        trade = _make_trade(
+            datetime.now(timezone.utc),
+            100.0,
+            1.0,
+            TradeSide.BUY,
+            1,
+        )
+        analyzer.ingest_trade(trade)
+
+        assert len(analyzer._trades_buffer) == 1
+        assert analyzer._trade_count == 1
+        assert analyzer._latest_metrics is None  # Not calculated yet
+
+    def test_metrics_calculation_interval(self):
+        """Test metrics are calculated at correct interval."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=5)
+        trades = []
+
+        for i in range(10):
+            trade = _make_trade(
+                datetime.now(timezone.utc),
+                100.0 + (i * 0.1),
+                1.0,
+                TradeSide.BUY if i % 2 == 0 else TradeSide.SELL,
+                i,
+            )
+            trades.append(trade)
+
+        # Ingest first 4 trades - no calculation
+        for i in range(4):
+            analyzer.ingest_trade(trades[i])
+            assert analyzer._latest_metrics is None
+
+        # 5th trade should trigger calculation
+        analyzer.ingest_trade(trades[4])
+        assert analyzer._latest_metrics is not None
+        assert analyzer._latest_metrics["trade_count"] == 5
+
+        # Ingest more trades without triggering
+        for i in range(5, 9):
+            analyzer.ingest_trade(trades[i])
+            # Metrics should still reflect first batch
+            assert analyzer._latest_metrics["trade_count"] == 5
+
+        # 10th trade should trigger second calculation
+        analyzer.ingest_trade(trades[9])
+        assert analyzer._latest_metrics["trade_count"] == 10
+
+    def test_get_latest_metrics(self):
+        """Test retrieving latest metrics."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=2)
+        
+        # No metrics initially
+        assert analyzer.get_latest_metrics() is None
+
+        # Add trades
+        trade1 = _make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1)
+        trade2 = _make_trade(datetime.now(timezone.utc), 101.0, 2.0, TradeSide.SELL, 2)
+
+        analyzer.ingest_trade(trade1)
+        analyzer.ingest_trade(trade2)
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        assert metrics["trade_count"] == 2
+        assert metrics["delta"] == -1.0  # 1 buy - 2 sells
+
+    def test_get_metrics_with_metadata(self):
+        """Test metrics endpoint response format."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=2)
+
+        trade1 = _make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1)
+        trade2 = _make_trade(datetime.now(timezone.utc), 101.0, 2.0, TradeSide.SELL, 2)
+
+        analyzer.ingest_trade(trade1)
+        analyzer.ingest_trade(trade2)
+
+        result = analyzer.get_metrics_with_metadata()
+
+        assert "metrics" in result
+        assert "metadata" in result
+        assert result["metrics"]["trade_count"] == 2
+        assert result["metadata"]["last_update"] is not None
+        assert result["metadata"]["trade_count"] == 2
+        assert result["metadata"]["buffer_size"] == 2
+
+    def test_reset_buffer(self):
+        """Test buffer reset functionality."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=2)
+
+        trade1 = _make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1)
+        trade2 = _make_trade(datetime.now(timezone.utc), 101.0, 2.0, TradeSide.SELL, 2)
+
+        analyzer.ingest_trade(trade1)
+        analyzer.ingest_trade(trade2)
+
+        assert len(analyzer._trades_buffer) == 2
+        assert analyzer._trade_count == 2
+
+        # Reset buffer
+        analyzer.reset_buffer()
+
+        assert len(analyzer._trades_buffer) == 0
+        assert analyzer._trade_count == 0
+        # But metrics should still be available
+        assert analyzer._latest_metrics is not None
+
+    def test_custom_metrics_calculator(self):
+        """Test with custom MetricsCalculator."""
+        custom_calc = MetricsCalculator(tick_size=0.01)
+        analyzer = OrderFlowAnalyzer(
+            metrics_calculator=custom_calc,
+            calculation_interval=1,
+        )
+
+        trade = _make_trade(datetime.now(timezone.utc), 100.123, 1.0, TradeSide.BUY, 1)
+        analyzer.ingest_trade(trade)
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        # With smaller tick size, POC should be precise
+        assert abs(metrics["poc"] - 100.12) < 0.01
+
+    def test_global_singleton(self):
+        """Test global singleton pattern."""
+        analyzer1 = get_orderflow_analyzer()
+        analyzer2 = get_orderflow_analyzer()
+
+        assert analyzer1 is analyzer2
+
+    def test_mixed_buy_sell_trades(self):
+        """Test with realistic buy/sell mix."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=4)
+        trades = [
+            _make_trade(datetime.now(timezone.utc), 100.0, 5.0, TradeSide.BUY, 1),
+            _make_trade(datetime.now(timezone.utc), 100.1, 3.0, TradeSide.SELL, 2),
+            _make_trade(datetime.now(timezone.utc), 100.2, 4.0, TradeSide.BUY, 3),
+            _make_trade(datetime.now(timezone.utc), 100.3, 2.0, TradeSide.SELL, 4),
+        ]
+
+        for trade in trades:
+            analyzer.ingest_trade(trade)
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+
+        # 2 buys (5+4=9) vs 2 sells (3+2=5) -> delta = 4
+        assert metrics["delta"] == 4.0
+        assert metrics["buy_volume"] == 9.0
+        assert metrics["sell_volume"] == 5.0
+        assert metrics["trade_count"] == 4
+
+    def test_large_volume_trades(self):
+        """Test with large volume trades."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=2)
+        trades = [
+            _make_trade(datetime.now(timezone.utc), 100.0, 1000.0, TradeSide.BUY, 1),
+            _make_trade(datetime.now(timezone.utc), 100.5, 500.0, TradeSide.SELL, 2),
+        ]
+
+        for trade in trades:
+            analyzer.ingest_trade(trade)
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        assert metrics["delta"] == 500.0
+        assert metrics["buy_volume"] == 1000.0
+        assert metrics["sell_volume"] == 500.0
+
+    def test_rapid_succession_trades(self):
+        """Test handling rapid succession of trades."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=10)
+        
+        # Add 20 trades rapidly
+        for i in range(20):
+            trade = _make_trade(
+                datetime.now(timezone.utc),
+                100.0 + (i % 5) * 0.1,
+                1.0,
+                TradeSide.BUY if i % 2 == 0 else TradeSide.SELL,
+                i,
+            )
+            analyzer.ingest_trade(trade)
+
+        # Should have calculated twice (at 10 and 20)
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        assert metrics["trade_count"] == 20
+        assert len(analyzer._trades_buffer) == 20
+
+    def test_metadata_timestamp_format(self):
+        """Test metadata returns proper ISO format timestamp."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=1)
+        trade = _make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1)
+        analyzer.ingest_trade(trade)
+
+        result = analyzer.get_metrics_with_metadata()
+        last_update = result["metadata"]["last_update"]
+
+        # Should be ISO format string
+        assert isinstance(last_update, str)
+        assert "T" in last_update
+        assert "Z" in last_update or "+" in last_update
