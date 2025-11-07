@@ -114,6 +114,15 @@ class Settings:
     profile_tick_size: float = field(
         default_factory=lambda: float(os.getenv("PROFILE_TICK_SIZE", "0.1"))
     )
+    backfill_rate_limit_threshold: int = field(
+        default_factory=lambda: int(os.getenv("BACKFILL_RATE_LIMIT_THRESHOLD", "3"))
+    )
+    backfill_cooldown_seconds: int = field(
+        default_factory=lambda: int(os.getenv("BACKFILL_COOLDOWN_SECONDS", "60"))
+    )
+    backfill_public_delay_ms: int = field(
+        default_factory=lambda: int(os.getenv("BACKFILL_PUBLIC_DELAY_MS", "100"))
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")

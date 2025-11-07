@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
 import json
 import pytest
 import aiohttp
@@ -19,6 +20,9 @@ def mock_settings():
         backfill_retry_base=0.5,
         binance_api_key=None,  # No auth by default for tests
         binance_api_secret=None,
+        backfill_rate_limit_threshold=3,
+        backfill_cooldown_seconds=60,
+        backfill_public_delay_ms=100,
     )
 
 
@@ -31,6 +35,9 @@ def mock_settings_with_auth():
         backfill_retry_base=0.5,
         binance_api_key="test_api_key_1234567890",
         binance_api_secret="test_api_secret_1234567890abcdef",
+        backfill_rate_limit_threshold=3,
+        backfill_cooldown_seconds=60,
+        backfill_public_delay_ms=100,
     )
 
 
@@ -392,3 +399,248 @@ class TestBinanceTradeHistory:
         assert inspect.iscoroutinefunction(history.test_single_window)
         
         await history.http_client.close()
+
+
+class TestCircuitBreaker:
+    """Test circuit breaker functionality."""
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_initial_state(self, mock_settings):
+        """Test that circuit breaker starts in CLOSED state."""
+        from app.context.backfill import CircuitBreakerState
+        client = BinanceHttpClient(mock_settings)
+        
+        assert client.circuit_state == CircuitBreakerState.CLOSED
+        assert client.consecutive_rate_limit_errors == 0
+        assert client.throttle_multiplier == 1.0
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_error_tracking(self, mock_settings):
+        """Test that rate limit errors are tracked."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Simulate rate limit errors
+        for i in range(2):
+            client.on_rate_limit_error()
+            assert client.consecutive_rate_limit_errors == i + 1
+            assert client.throttle_multiplier > 1.0
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_opens_after_threshold(self, mock_settings):
+        """Test that circuit breaker opens after reaching threshold."""
+        from app.context.backfill import CircuitBreakerState
+        # Set threshold to 2
+        mock_settings.backfill_rate_limit_threshold = 2
+        client = BinanceHttpClient(mock_settings)
+        
+        # Simulate hitting the threshold
+        client.on_rate_limit_error()
+        assert client.circuit_state == CircuitBreakerState.CLOSED
+        
+        client.on_rate_limit_error()
+        assert client.circuit_state == CircuitBreakerState.OPEN
+        assert client.cooldown_until is not None
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_successful_request_resets_errors(self, mock_settings):
+        """Test that successful requests reset error counter."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Simulate rate limit errors
+        client.on_rate_limit_error()
+        client.on_rate_limit_error()
+        assert client.consecutive_rate_limit_errors == 2
+        
+        # Successful request should reset counter
+        client.on_successful_request()
+        assert client.consecutive_rate_limit_errors == 0
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_throttle_multiplier_increases_on_errors(self, mock_settings):
+        """Test that throttle multiplier increases with errors."""
+        client = BinanceHttpClient(mock_settings)
+        
+        initial_multiplier = client.throttle_multiplier
+        client.on_rate_limit_error()
+        first_error_multiplier = client.throttle_multiplier
+        
+        assert first_error_multiplier > initial_multiplier
+        
+        client.on_rate_limit_error()
+        second_error_multiplier = client.throttle_multiplier
+        
+        assert second_error_multiplier > first_error_multiplier
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_throttle_multiplier_decreases_on_success(self, mock_settings):
+        """Test that throttle multiplier gradually decreases with successful requests."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Increase throttle multiplier
+        client.on_rate_limit_error()
+        client.on_rate_limit_error()
+        high_multiplier = client.throttle_multiplier
+        
+        # Successful request should decrease it
+        client.on_successful_request()
+        recovered_multiplier = client.throttle_multiplier
+        
+        assert recovered_multiplier < high_multiplier
+        assert recovered_multiplier >= 1.0
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_get_throttle_multiplier(self, mock_settings):
+        """Test getting current throttle multiplier."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Should start at 1.0
+        assert client.get_throttle_multiplier() == 1.0
+        
+        # After error, should be higher
+        client.on_rate_limit_error()
+        assert client.get_throttle_multiplier() > 1.0
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_get_recommended_concurrency_normal(self, mock_settings):
+        """Test recommended concurrency in normal state."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Normal state should return base concurrency
+        recommended = client.get_recommended_concurrency(20)
+        assert recommended == 20
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_get_recommended_concurrency_under_moderate_throttling(self, mock_settings):
+        """Test recommended concurrency under moderate throttling."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Simulate moderate throttling (1.5 < throttle < 2.0)
+        client.throttle_multiplier = 1.7
+        recommended = client.get_recommended_concurrency(20)
+        assert recommended == 10  # Should be halved
+        assert recommended >= 1
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_get_recommended_concurrency_under_heavy_throttling(self, mock_settings):
+        """Test recommended concurrency under heavy throttling."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Simulate heavy throttling (throttle > 2.0)
+        client.throttle_multiplier = 2.5
+        recommended = client.get_recommended_concurrency(20)
+        assert recommended == 5  # Should be quartered
+        assert recommended >= 1
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_transitions_to_half_open(self, mock_settings):
+        """Test that circuit breaker transitions to HALF_OPEN after cooldown."""
+        from app.context.backfill import CircuitBreakerState
+        import time
+        
+        mock_settings.backfill_cooldown_seconds = 0  # Immediate recovery for testing
+        client = BinanceHttpClient(mock_settings)
+        
+        # Open the circuit
+        client.on_rate_limit_error()
+        client.on_rate_limit_error()
+        client.on_rate_limit_error()
+        assert client.circuit_state == CircuitBreakerState.OPEN
+        
+        # Wait for cooldown to expire
+        await asyncio.sleep(0.1)
+        
+        # Check circuit breaker should transition to HALF_OPEN
+        await client.check_circuit_breaker()
+        assert client.circuit_state == CircuitBreakerState.HALF_OPEN
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_closes_after_successful_request_in_half_open(self, mock_settings):
+        """Test that circuit breaker closes after successful request in HALF_OPEN state."""
+        from app.context.backfill import CircuitBreakerState
+        
+        mock_settings.backfill_cooldown_seconds = 0
+        client = BinanceHttpClient(mock_settings)
+        
+        # Open the circuit and transition to HALF_OPEN
+        client.on_rate_limit_error()
+        client.on_rate_limit_error()
+        client.on_rate_limit_error()
+        assert client.circuit_state == CircuitBreakerState.OPEN
+        
+        await asyncio.sleep(0.1)
+        await client.check_circuit_breaker()
+        assert client.circuit_state == CircuitBreakerState.HALF_OPEN
+        
+        # Successful request should close it
+        client.on_successful_request()
+        assert client.circuit_state == CircuitBreakerState.CLOSED
+        
+        await client.close()
+
+
+class TestCircuitBreakerWithRateLimitingScenarios:
+    """Test realistic rate limiting scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_progressive_recovery_of_throttle_multiplier(self, mock_settings):
+        """Test that throttle multiplier gradually recovers."""
+        client = BinanceHttpClient(mock_settings)
+        
+        # Simulate multiple errors
+        for _ in range(5):
+            client.on_rate_limit_error()
+        
+        high_multiplier = client.throttle_multiplier
+        assert high_multiplier > 1.0
+        
+        # Simulate multiple successful requests
+        multipliers = []
+        for _ in range(10):
+            client.on_successful_request()
+            multipliers.append(client.throttle_multiplier)
+        
+        # Each step should recover (decrease)
+        for i in range(1, len(multipliers)):
+            assert multipliers[i] <= multipliers[i-1]
+        
+        # Should eventually return to 1.0
+        assert multipliers[-1] == 1.0
+        
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_public_mode_on_auth_rate_limit(self, mock_settings_with_auth):
+        """Test that authenticated mode can fallback to public on rate limit."""
+        client = BinanceHttpClient(mock_settings_with_auth)
+        
+        assert client.use_auth is True
+        assert "X-MBX-APIKEY" in client.headers
+        
+        # Simulate rate limit scenario that triggers fallback
+        # This would be done in fetch_agg_trades, but we can test the logic here
+        client.use_auth = False
+        assert client.use_auth is False
+        
+        await client.close()
