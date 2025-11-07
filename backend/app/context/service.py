@@ -17,6 +17,7 @@ import polars as pl
 from app.ws.models import Settings, TradeSide, TradeTick, get_settings
 
 from .backfill import BinanceTradeHistory, TradeHistoryProvider
+from .price_bins import quantize_price_to_tick, get_effective_tick_size, validate_tick_size, PriceBinningError
 
 logger = logging.getLogger("context")
 
@@ -60,6 +61,9 @@ class ContextService:
         self.step_size: Optional[float] = exchange_info.step_size if exchange_info else None
         self.min_qty: Optional[float] = exchange_info.min_qty if exchange_info else None
         self.min_notional: Optional[float] = exchange_info.min_notional if exchange_info else None
+        
+        # Ensure we always have an effective tick size for price binning
+        self._ensure_effective_tick_size()
 
         self.prev_day_levels: Dict[str, Optional[float]] = {
             "PDH": None,
@@ -106,8 +110,12 @@ class ContextService:
 
         if self.exchange_info is not None and not self._exchange_info_logged:
             self._log_exchange_info(self.exchange_info)
+            # Update tick size after successful exchange info fetch
+            self._ensure_effective_tick_size()
         elif self.exchange_info is None:
             logger.warning("exchange_info_unavailable symbol=%s", self.settings.symbol)
+            # Ensure we have a fallback tick size
+            self._ensure_effective_tick_size()
 
         now = self._now_provider()
         today = now.date()
@@ -626,13 +634,34 @@ class ContextService:
         }
 
     def _bin_price(self, price: float) -> float:
-        tick = self.tick_size
-        if not tick or tick <= 0:
+        """Bin price using the shared price binning utility with proper tick size handling."""
+        try:
+            # Get effective tick size (exchange info or fallback)
+            effective_tick, used_exchange = get_effective_tick_size(
+                self.tick_size,
+                self.settings.profile_tick_size,
+                self.settings.symbol,
+            )
+            
+            # Validate tick size is reasonable
+            validate_tick_size(effective_tick, self.settings.symbol)
+            
+            # Quantize price using precise Decimal math
+            return quantize_price_to_tick(
+                price,
+                effective_tick,
+                self.settings.profile_tick_size,
+                self.settings.symbol,
+            )
+        except PriceBinningError as exc:
+            logger.error(
+                "price_binning_failed symbol=%s price=%s error=%s",
+                self.settings.symbol,
+                price,
+                exc,
+            )
+            # Fallback to original price to avoid crashing
             return price
-        price_dec = Decimal(str(price))
-        tick_dec = Decimal(str(tick))
-        bins = (price_dec / tick_dec).to_integral_value(rounding=ROUND_FLOOR)
-        return float(bins * tick_dec)
 
     def _update_poc_state(self, price_bin: float, volume: float) -> None:
         if (
@@ -777,6 +806,43 @@ class ContextService:
         if not self.day_start:
             return False
         return self.day_start <= now < self.day_start + timedelta(days=1)
+
+    def _ensure_effective_tick_size(self) -> None:
+        """Ensure we always have a valid tick size for price binning."""
+        try:
+            effective_tick, used_exchange = get_effective_tick_size(
+                self.tick_size,
+                self.settings.profile_tick_size,
+                self.settings.symbol,
+            )
+            
+            # Validate the tick size
+            validate_tick_size(effective_tick, self.settings.symbol)
+            
+            # Store the effective tick size
+            self._effective_tick_size = effective_tick
+            
+            if not used_exchange:
+                logger.info(
+                    "price_binning_using_fallback symbol=%s tickSize=%s",
+                    self.settings.symbol,
+                    effective_tick,
+                )
+            else:
+                logger.debug(
+                    "price_binning_using_exchange symbol=%s tickSize=%s",
+                    self.settings.symbol,
+                    effective_tick,
+                )
+                
+        except Exception as exc:
+            logger.error(
+                "price_binning_init_failed symbol=%s error=%s",
+                self.settings.symbol,
+                exc,
+            )
+            # Use default fallback as last resort
+            self._effective_tick_size = 0.1
 
 
 _service_instance: Optional[ContextService] = None
