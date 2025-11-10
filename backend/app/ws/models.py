@@ -129,6 +129,18 @@ class Settings:
     backfill_cache_dir: str = field(
         default_factory=lambda: os.getenv("BACKFILL_CACHE_DIR", "./context_history_dir/backfill_cache")
     )
+    data_source: str = field(
+        default_factory=lambda: os.getenv("DATA_SOURCE", "binance_ws")
+    )
+    connector_name: Optional[str] = field(
+        default_factory=lambda: os.getenv("CONNECTOR_NAME")
+    )
+    connector_poll_interval_ms: int = field(
+        default_factory=lambda: int(os.getenv("CONNECTOR_POLL_INTERVAL_MS", "100"))
+    )
+    connector_paper_trading: bool = field(
+        default_factory=lambda: _env_bool("CONNECTOR_PAPER_TRADING", "true")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
