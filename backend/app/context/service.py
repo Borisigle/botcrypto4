@@ -122,7 +122,9 @@ class ContextService:
         self._roll_day(today)
 
         prev_levels_loaded = False
-        if self.settings.context_backfill_enabled:
+        if self.settings.data_source.lower() == "hft_connector":
+            logger.info("Backfill: skipped (using HFT connector for live data)")
+        elif self.settings.context_backfill_enabled:
             try:
                 prev_levels_loaded = await self._perform_backfill(now)
             except Exception as exc:  # pragma: no cover - diagnostic logging

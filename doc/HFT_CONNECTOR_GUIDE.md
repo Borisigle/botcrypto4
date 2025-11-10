@@ -40,6 +40,13 @@ Context Service + Strategy Engine
 
 ## Configuration
 
+### Key Behavior Note
+
+**When `DATA_SOURCE=hft_connector`:**
+- REST API backfill is automatically disabled
+- The connector feeds live data directly to context service and strategy engine
+- Previous day levels can still be loaded via `CONTEXT_BOOTSTRAP_PREV_DAY=true`
+
 ### Environment Variables
 
 Add to `.env` or set in environment:
@@ -52,6 +59,9 @@ DATA_SOURCE=hft_connector
 CONNECTOR_NAME=binance_hft
 CONNECTOR_POLL_INTERVAL_MS=100
 CONNECTOR_PAPER_TRADING=true
+
+# Note: Backfill is automatically disabled when using HFT connector
+# CONTEXT_BACKFILL_ENABLED is ignored in this mode
 ```
 
 ### Settings Dataclass
