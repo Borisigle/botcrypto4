@@ -125,6 +125,7 @@ class HFTConnectorStream(BaseStreamService):
                     symbol=self.settings.symbol,
                     connector="hft",
                 )
+                self.logger.info("Connector stream started, receiving live data")
                 return
             except Exception as exc:
                 self._reconnection_attempts += 1
