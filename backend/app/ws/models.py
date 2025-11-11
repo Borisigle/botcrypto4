@@ -178,6 +178,13 @@ class Settings:
     bybit_backfill_max_concurrent_chunks: int = field(
         default_factory=lambda: int(os.getenv("BYBIT_BACKFILL_MAX_CONCURRENT_CHUNKS", "8"))
     )
+    # Bybit connector configuration (for live streaming)
+    bybit_connector_config_file: Optional[str] = field(
+        default_factory=lambda: os.getenv("BYBIT_CONNECTOR_CONFIG_FILE")
+    )
+    bybit_connector_testnet: bool = field(
+        default_factory=lambda: _env_bool("BYBIT_CONNECTOR_TESTNET", "false")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")

@@ -30,7 +30,8 @@ class WSModule:
         self._connector_stream: Optional[HFTConnectorStream] = None
 
         # Initialize based on data source configuration
-        if self.settings.data_source.lower() == "hft_connector":
+        data_source_lower = self.settings.data_source.lower()
+        if data_source_lower in ("hft_connector", "bybit_connector"):
             # Connector mode will be initialized on demand
             self.trade_stream = None
             self.depth_stream = None
@@ -53,7 +54,8 @@ class WSModule:
             pass
 
     async def startup(self) -> None:
-        if self.settings.data_source.lower() == "hft_connector":
+        data_source_lower = self.settings.data_source.lower()
+        if data_source_lower in ("hft_connector", "bybit_connector"):
             # Initialize connector mode on startup
             await self._setup_connector_mode()
         else:
@@ -62,7 +64,8 @@ class WSModule:
             await self.depth_stream.start()
 
     async def shutdown(self) -> None:
-        if self.settings.data_source.lower() == "hft_connector":
+        data_source_lower = self.settings.data_source.lower()
+        if data_source_lower in ("hft_connector", "bybit_connector"):
             if self._connector_stream:
                 await self._connector_stream.stop()
         else:
@@ -72,13 +75,20 @@ class WSModule:
                 await self.depth_stream.stop()
 
     async def _setup_connector_mode(self) -> None:
-        """Setup connector mode with stubbed connector for testing."""
+        """Setup connector mode with appropriate connector implementation."""
         from app.data_sources.hft_connector import StubbedConnector
+        from app.data_sources.bybit_connector import BybitConnector
 
-        connector = StubbedConnector(self.settings)
+        # Select connector based on configuration
+        if self.settings.data_source.lower() == "bybit_connector":
+            connector_impl = BybitConnector(self.settings)
+        else:
+            # Default to stubbed connector for testing
+            connector_impl = StubbedConnector(self.settings)
+
         self._connector_stream = HFTConnectorStream(
             self.settings,
-            connector,
+            connector_impl,
             self.metrics,
             context_service=self.context_service,
         )
@@ -88,7 +98,8 @@ class WSModule:
         await self._connector_stream.start()
 
     def health_payload(self) -> Dict[str, Dict[str, Any]]:
-        if self.settings.data_source.lower() == "hft_connector":
+        data_source_lower = self.settings.data_source.lower()
+        if data_source_lower in ("hft_connector", "bybit_connector"):
             if self._connector_stream:
                 health = self._connector_stream.health()
                 return {
@@ -102,7 +113,8 @@ class WSModule:
             }
 
     def metrics_payload(self) -> Dict[str, Any]:
-        if self.settings.data_source.lower() == "hft_connector":
+        data_source_lower = self.settings.data_source.lower()
+        if data_source_lower in ("hft_connector", "bybit_connector"):
             queue_size = self._connector_stream.queue_size if self._connector_stream else 0
             snapshot: MetricsSnapshot = self.metrics.snapshot(
                 trade_queue_size=queue_size,
