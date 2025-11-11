@@ -16,7 +16,7 @@ import polars as pl
 
 from app.ws.models import Settings, TradeSide, TradeTick, get_settings
 
-from .backfill import BinanceTradeHistory, TradeHistoryProvider
+from .backfill import BinanceTradeHistory, BybitConnectorHistory, TradeHistoryProvider
 from .price_bins import quantize_price_to_tick, get_effective_tick_size, validate_tick_size, PriceBinningError
 
 logger = logging.getLogger("context")
@@ -419,7 +419,13 @@ class ContextService:
 
     def _get_history_provider(self) -> Optional[TradeHistoryProvider]:
         if self._history_provider is None:
-            self._history_provider = BinanceTradeHistory(self.settings)
+            # Choose provider based on configuration
+            if self.settings.data_source.lower() == "bybit":
+                logger.info("Using BybitConnectorHistory for backfill")
+                self._history_provider = BybitConnectorHistory(self.settings)
+            else:
+                logger.info("Using BinanceTradeHistory for backfill")
+                self._history_provider = BinanceTradeHistory(self.settings)
         return self._history_provider
 
     async def _perform_backfill(self, now: datetime) -> bool:

@@ -9,7 +9,7 @@ import pytest
 import polars as pl
 
 from app.context.backfill_cache import BackfillCacheManager
-from app.context.backfill import BinanceTradeHistory
+from app.context.backfill import BinanceTradeHistory, BybitConnectorHistory
 from app.ws.models import Settings, TradeTick, TradeSide
 
 
@@ -371,3 +371,237 @@ class TestBackfillCacheIntegration:
         assert loaded is not None
         assert len(loaded) == 1
         assert loaded[0]["a"] == 1000
+
+
+class TestBybitCacheIntegration:
+    """Test cache integration with BybitConnectorHistory."""
+
+    @pytest.mark.asyncio
+    async def test_bybit_trade_tick_to_dict_conversion(self, mock_settings):
+        """Test conversion of TradeTick to dict for Bybit cache storage."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                backfill_cache_enabled=True,
+                backfill_cache_dir=tmpdir,
+                context_backfill_enabled=True,
+            )
+            history = BybitConnectorHistory(settings)
+            
+            trade = TradeTick(
+                ts=datetime(2025, 11, 7, 12, 30, 0, tzinfo=timezone.utc),
+                price=50000.0,
+                qty=0.1,
+                side="buy",
+                isBuyerMaker=False,
+                id=12345
+            )
+            
+            trade_dict = history._trade_tick_to_dict(trade)
+            
+            assert trade_dict["T"] == 1751999400000  # timestamp in ms
+            assert trade_dict["i"] == "12345"  # ID as string
+            assert trade_dict["p"] == 50000.0
+            assert trade_dict["q"] == 0.1
+            assert trade_dict["s"] == "buy"
+            assert trade_dict["m"] is False
+
+    @pytest.mark.asyncio
+    async def test_bybit_dicts_to_trade_ticks_conversion(self, mock_settings):
+        """Test conversion of dicts to TradeTick objects for Bybit."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                backfill_cache_enabled=True,
+                backfill_cache_dir=tmpdir,
+                context_backfill_enabled=True,
+            )
+            history = BybitConnectorHistory(settings)
+            
+            dicts = [
+                {
+                    "T": 1699296000000,
+                    "i": "1000",
+                    "p": 100.5,
+                    "q": 1.5,
+                    "s": "buy",
+                    "m": False,
+                },
+                {
+                    "T": 1699296060000,
+                    "i": "1001",
+                    "p": 100.6,
+                    "q": 1.6,
+                    "s": "sell",
+                    "m": True,
+                },
+            ]
+            
+            trades = history._dicts_to_trade_ticks(dicts)
+            
+            assert len(trades) == 2
+            assert trades[0].id == 1000  # String converted to int
+            assert trades[0].price == 100.5
+            assert trades[0].side == "buy"
+            assert trades[1].isBuyerMaker is True
+
+    @pytest.mark.asyncio
+    async def test_bybit_roundtrip_conversion(self, mock_settings, sample_trades):
+        """Test that Bybit trades can be converted to dict and back without loss."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                backfill_cache_enabled=True,
+                backfill_cache_dir=tmpdir,
+                context_backfill_enabled=True,
+            )
+            history = BybitConnectorHistory(settings)
+            
+            # Convert trades to dict and back
+            dicts = [history._trade_tick_to_dict(trade) for trade in sample_trades]
+            restored_trades = history._dicts_to_trade_ticks(dicts)
+            
+            assert len(restored_trades) == len(sample_trades)
+            
+            for original, restored in zip(sample_trades, restored_trades):
+                assert restored.ts == original.ts
+                assert restored.price == original.price
+                assert restored.qty == original.qty
+                assert restored.side == original.side
+                assert restored.isBuyerMaker == original.isBuyerMaker
+                assert restored.id == original.id
+
+    @pytest.mark.asyncio
+    async def test_bybit_cache_persistence(self, temp_cache_dir):
+        """Test that Bybit cache persists across history instances."""
+        date = datetime(2025, 11, 7, tzinfo=timezone.utc)
+        trade = TradeTick(
+            ts=date,
+            price=50000.0,
+            qty=0.1,
+            side="buy",
+            isBuyerMaker=False,
+            id=12345
+        )
+        
+        # Save with first history instance
+        settings1 = Settings(
+            backfill_cache_enabled=True,
+            backfill_cache_dir=temp_cache_dir,
+            context_backfill_enabled=True,
+        )
+        history1 = BybitConnectorHistory(settings1)
+        
+        dicts = [history1._trade_tick_to_dict(trade)]
+        history1.cache_manager.save_trades_to_cache(dicts, date)
+        
+        # Load with second history instance
+        settings2 = Settings(
+            backfill_cache_enabled=True,
+            backfill_cache_dir=temp_cache_dir,
+            context_backfill_enabled=True,
+        )
+        history2 = BybitConnectorHistory(settings2)
+        loaded_dicts = history2.cache_manager.load_cached_trades(date)
+        
+        assert loaded_dicts is not None
+        assert len(loaded_dicts) == 1
+        assert loaded_dicts[0]["i"] == "12345"
+        assert loaded_dicts[0]["p"] == 50000.0
+
+    @pytest.mark.asyncio
+    async def test_bybit_cache_resume_functionality(self, mock_settings):
+        """Test cache resume functionality with Bybit backfill."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                backfill_cache_enabled=True,
+                backfill_cache_dir=tmpdir,
+                context_backfill_enabled=True,
+            )
+            history = BybitConnectorHistory(settings)
+            
+            # Create initial cached data
+            start_dt = datetime(2025, 11, 7, 0, 0, 0, tzinfo=timezone.utc)
+            cached_trade = TradeTick(
+                ts=start_dt + timedelta(hours=2),
+                price=50000.0,
+                qty=0.1,
+                side="buy",
+                isBuyerMaker=False,
+                id=1000
+            )
+            
+            cached_dicts = [history._trade_tick_to_dict(cached_trade)]
+            history.cache_manager.save_trades_to_cache(cached_dicts, start_dt.date())
+            
+            # Mock new data fetch for gap
+            new_trade = TradeTick(
+                ts=start_dt + timedelta(hours=4),
+                price=50100.0,
+                qty=0.2,
+                side="sell",
+                isBuyerMaker=True,
+                id=1001
+            )
+            
+            with patch.object(history, '_backfill_parallel', new_callable=AsyncMock) as mock_backfill:
+                mock_backfill.return_value = [new_trade]
+                
+                # Perform cache-aware backfill
+                result_trades = await history.backfill_with_cache(start_dt, start_dt + timedelta(hours=6))
+                
+                # Should have both cached and new trades
+                assert len(result_trades) == 2
+                mock_backfill.assert_called_once()
+                
+                # Verify cache was updated
+                updated_cache = history.cache_manager.load_cached_trades(start_dt.date())
+                assert len(updated_cache) == 2
+
+    @pytest.mark.asyncio
+    async def test_bybit_cache_deduplication(self, mock_settings):
+        """Test that duplicate trades are properly deduplicated with Bybit data."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                backfill_cache_enabled=True,
+                backfill_cache_dir=tmpdir,
+                context_backfill_enabled=True,
+            )
+            history = BybitConnectorHistory(settings)
+            
+            # Create trades with duplicate IDs
+            base_time = datetime(2025, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
+            trades = [
+                TradeTick(
+                    ts=base_time,
+                    price=50000.0,
+                    qty=0.1,
+                    side="buy",
+                    isBuyerMaker=False,
+                    id=1000  # Duplicate ID
+                ),
+                TradeTick(
+                    ts=base_time + timedelta(minutes=1),
+                    price=50001.0,
+                    qty=0.2,
+                    side="sell",
+                    isBuyerMaker=True,
+                    id=1001
+                ),
+                TradeTick(
+                    ts=base_time + timedelta(minutes=2),
+                    price=50002.0,
+                    qty=0.15,
+                    side="buy",
+                    isBuyerMaker=False,
+                    id=1000  # Duplicate ID
+                ),
+            ]
+            
+            # Convert to dicts and save through cache manager
+            trade_dicts = [history._trade_tick_to_dict(trade) for trade in trades]
+            deduplicated = history.cache_manager.deduplicate_trades(trade_dicts)
+            
+            # Should remove duplicate by ID
+            assert len(deduplicated) == 2
+            ids = [int(d["i"]) for d in deduplicated]
+            assert 1000 in ids
+            assert 1001 in ids
+            assert len([i for i in ids if i == 1000]) == 1  # Only one instance
