@@ -665,3 +665,55 @@ async def test_backfill_executed_with_binance_ws() -> None:
     assert service.settings.data_source.lower() != "hft_connector"
     
     await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_backfill_executed_with_bybit_connector(caplog) -> None:
+    """Test that backfill is executed when using bybit_connector data source."""
+    import logging
+    caplog.set_level(logging.INFO, logger="context")
+    
+    current_now = [datetime(2024, 1, 1, 9, tzinfo=timezone.utc)]
+
+    # Mock history provider that would be called for backfill
+    backfill_called = []
+
+    class TrackingHistoryProvider:
+        async def iterate_trades(self, start: datetime, end: datetime):
+            backfill_called.append(True)
+            # Yield a sample trade
+            yield _make_trade(
+                datetime(2024, 1, 1, 8, 30, tzinfo=timezone.utc),
+                42000,
+                1.0,
+                TradeSide.BUY,
+                1,
+            )
+
+    settings = Settings(
+        context_bootstrap_prev_day=False,
+        context_backfill_enabled=True,
+        data_source="bybit_connector",
+    )
+    service = ContextService(
+        settings=settings,
+        now_provider=lambda: current_now[0],
+        history_provider=TrackingHistoryProvider(),
+        fetch_exchange_info=False,
+    )
+    await service.startup()
+
+    # Verify that backfill WAS called (it's called for today's trades and previous day)
+    # So we expect at least 1 call (today's backfill)
+    assert len(backfill_called) >= 1, "Backfill should be executed with bybit_connector"
+    assert service._started is True
+    # Verify trades were ingested from backfill
+    assert service.trade_count >= 1
+    assert service.last_trade_price == 42000
+    
+    # Verify that backfill was actually performed (not skipped)
+    assert any("Backfill: Dynamic range" in record.message for record in caplog.records)
+    # Verify that the backfill completed (should see completion log)
+    assert any("Backfill complete:" in record.message for record in caplog.records)
+    
+    await service.shutdown()
