@@ -313,10 +313,12 @@ class BinanceHttpClient:
         raise Exception("All retries failed")
     
     def _exponential_backoff(self, attempt: int, base: Optional[float] = None, max_delay: float = 30) -> float:
-        """Calculate exponential backoff with jitter."""
+        """Calculate exponential backoff with jitter using configurable backoff multiplier."""
         if base is None:
             base = self.retry_base
-        delay = base * (2 ** attempt)
+        # Apply backoff multiplier from settings
+        backoff_multiplier = self.settings.backfill_retry_backoff
+        delay = base * (backoff_multiplier ** attempt)
         delay = min(delay, max_delay)
         jitter = delay * 0.2 * (random.random() - 0.5)
         return delay + jitter
@@ -349,7 +351,7 @@ class BinanceTradeHistory:
         request_delay: Optional[float] = None,
         max_retries: int = 5,
         chunk_minutes: int = 10,
-        max_concurrent_chunks: int = 5,
+        max_concurrent_chunks: int = 3,  # Reduced default for adaptive behavior
         max_iterations_per_chunk: int = 500,
     ) -> None:
         self.settings = settings
@@ -487,7 +489,7 @@ class BinanceTradeHistory:
         
         if cached_trades_dicts:
             # Cache hit - determine if we need to download new data
-            logger.info(f"Cache found: {len(cached_trades_dicts)} trades from {today.isoformat()}")
+            logger.info(f"Backfill cache: HIT ({len(cached_trades_dicts)} trades from {today.isoformat()})")
             
             # Convert dict trades back to TradeTick objects
             cached_trades = self._dicts_to_trade_ticks(cached_trades_dicts)
@@ -544,7 +546,9 @@ class BinanceTradeHistory:
                     all_trades = cached_trades
         else:
             # No cache - do full backfill
-            logger.info(f"No cache for {today.isoformat()}, doing full backfill")
+            duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
+            chunk_count = max(1, (duration_minutes + 9) // 10)  # Round up to nearest 10min chunk
+            logger.info(f"Backfill cache: MISS, downloading {chunk_count} chunks")
             all_trades = await self._backfill_parallel(start_dt, end_dt)
         
         # Save to cache (always update to include latest data)
@@ -634,22 +638,26 @@ class BinanceTradeHistory:
         chunks = self._split_time_range(start_dt, end_dt, self.chunk_minutes)
         
         logger.info(
-            "Backfill: %d chunks (%d min each), max %d concurrent from %s to %s",
+            "Backfill: %d chunks (%d min each), adaptive concurrency (start: %d) from %s to %s",
             len(chunks),
             self.chunk_minutes,
-            self.max_concurrent_chunks,
+            current_concurrency,
             start_dt.isoformat(),
             end_dt.isoformat(),
         )
         
-        # Track failed chunks for retry
+        # Track failed chunks for retry and adaptive concurrency
         failed_chunk_indices = []
-        current_concurrency = self.max_concurrent_chunks
+        rate_limit_errors = 0
+        # Use adaptive concurrency: start with 3, reduce to 1 if 429 errors spike
+        base_concurrency = 3
+        current_concurrency = base_concurrency
         current_request_delay = self.request_delay
         
         semaphore = asyncio.Semaphore(current_concurrency)
         
         async def fetch_chunk_throttled(chunk_index: int, chunk_start: datetime, chunk_end: datetime) -> Tuple[int, List[TradeTick], bool]:
+            nonlocal rate_limit_errors, current_concurrency, semaphore
             async with semaphore:
                 # Adjust delay based on rate limit pressure
                 throttle_multiplier = self.http_client.get_throttle_multiplier()
@@ -660,6 +668,17 @@ class BinanceTradeHistory:
                     trades = await self._fetch_trades_paginated(chunk_start, chunk_end)
                     return chunk_index, trades, True
                 except Exception as exc:
+                    # Check for rate limit errors and adapt concurrency
+                    if "429" in str(exc) or "418" in str(exc):
+                        rate_limit_errors += 1
+                        if rate_limit_errors >= 3 and current_concurrency > 1:
+                            logger.warning(
+                                "Rate limit errors detected (%d), reducing concurrency from %d to 1",
+                                rate_limit_errors, current_concurrency
+                            )
+                            current_concurrency = 1
+                            semaphore = asyncio.Semaphore(current_concurrency)
+                    
                     logger.warning(
                         "Chunk %d failed: %s to %s - %s, continuing...",
                         chunk_index,
@@ -780,22 +799,13 @@ class BinanceTradeHistory:
                 poc_price = max(price_volumes, key=price_volumes.get)
         
         logger.info(
-            "Backfill complete: ~%d trades in %.1fs, %.1f%% chunks successful (%d/%d)",
+            "Backfill complete: ~%d trades in %.1fs, %.1f%% chunks successful, VWAP=%.2f, POC=%.2f",
             len(all_trades),
             elapsed_time,
             success_rate,
-            successful_chunks,
-            len(chunks),
-        )
-        logger.info(
-            "  VWAP: %.3f",
             vwap,
+            poc_price,
         )
-        if poc_price > 0:
-            logger.info(
-                "  POCd: %.3f",
-                poc_price,
-            )
         
         return all_trades
 

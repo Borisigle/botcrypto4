@@ -129,6 +129,12 @@ class Settings:
     backfill_cache_dir: str = field(
         default_factory=lambda: os.getenv("BACKFILL_CACHE_DIR", "./context_history_dir/backfill_cache")
     )
+    backfill_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("BACKFILL_TIMEOUT_SECONDS", "180"))
+    )
+    backfill_retry_backoff: float = field(
+        default_factory=lambda: float(os.getenv("BACKFILL_RETRY_BACKOFF", "2.0"))
+    )
     data_source: str = field(
         default_factory=lambda: os.getenv("DATA_SOURCE", "binance_ws")
     )

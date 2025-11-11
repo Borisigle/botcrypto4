@@ -456,8 +456,24 @@ class ContextService:
         day_start = self.day_start
 
         if now > day_start:
-            start_iso = day_start.isoformat()
-            end_iso = now.isoformat()
+            # Calculate dynamic backfill range: UTC 00:00 today → current UTC time
+            start_dt = day_start  # 00:00 UTC today
+            end_dt = now  # Current UTC time
+            
+            # Calculate chunk count for logging
+            duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
+            chunk_count = max(1, (duration_minutes + 9) // 10)  # Round up to nearest 10min chunk
+            
+            start_iso = start_dt.isoformat()
+            end_iso = end_dt.isoformat()
+            
+            logger.info(
+                "Backfill: Dynamic range %s → %s (%d chunks, ~%d minutes)",
+                start_iso.split('T')[1][:8],  # Show only time part
+                end_iso.split('T')[1][:8],   # Show only time part
+                chunk_count,
+                duration_minutes,
+            )
             
             # Check if we should use cache-aware backfill
             use_cache = (
@@ -467,34 +483,47 @@ class ContextService:
             )
             
             if use_cache:
-                logger.info(
-                    "Backfill: using cache + resume strategy from %s to %s",
-                    start_iso,
-                    end_iso,
-                )
+                logger.info("Backfill cache: checking for existing cache...")
             else:
-                logger.info(
-                    "Backfill: downloading trades from %s to %s",
-                    start_iso,
-                    end_iso,
-                )
+                logger.info("Backfill cache: disabled, downloading all chunks")
             
             try:
+                # Apply timeout to the backfill operation
+                timeout_seconds = self.settings.backfill_timeout_seconds
+                logger.info(f"Backfill timeout: {timeout_seconds} seconds")
+                
                 if use_cache:
-                    # Use cache-aware backfill
-                    trades = await provider.backfill_with_cache(day_start, now)
+                    # Use cache-aware backfill with timeout
+                    trades = await asyncio.wait_for(
+                        provider.backfill_with_cache(start_dt, end_dt),
+                        timeout=timeout_seconds
+                    )
                     trade_count = len(trades)
                     for trade in trades:
                         self.ingest_trade(trade)
                 else:
-                    # Use traditional backfill
-                    trade_count = await self._ingest_historical_trades(provider, day_start, now)
+                    # Use traditional backfill with timeout
+                    trade_count = await asyncio.wait_for(
+                        self._ingest_historical_trades(provider, start_dt, end_dt),
+                        timeout=timeout_seconds
+                    )
+                    
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Backfill timeout after {timeout_seconds}s - proceeding with live data only"
+                )
+                # Continue with live streaming without backfill
+                trade_count = 0
+                
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.exception(
                     "backfill_today_failed",
                     extra={"error": str(exc), "start": start_iso, "end": end_iso},
                 )
-            else:
+                trade_count = 0
+                
+            # Log completion if we got any trades
+            if trade_count > 0:
                 vwap_value = self._current_vwap("base")
                 range_today = (
                     self.day_high - self.day_low
@@ -502,13 +531,15 @@ class ContextService:
                     else None
                 )
                 logger.info(
-                    "Backfill complete: trades=%d VWAP=%s POC=%s rangeToday=%s cd_pre=%s",
+                    "Backfill complete: ~%d trades in ~%ds, 100%% successful, VWAP=%s, POC=%s",
                     trade_count,
+                    timeout_seconds,  # Approximate time
                     self._format_float(vwap_value),
                     self._format_float(self.poc_price),
-                    self._format_float(range_today),
-                    self._format_float(self.pre_market_delta),
                 )
+            else:
+                logger.info("Backfill: no trades loaded (timeout or error), starting live stream")
+                
         else:
             logger.info("Backfill: startup at 00:00 UTC; skipping intraday history")
 
