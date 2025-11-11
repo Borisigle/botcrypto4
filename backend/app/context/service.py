@@ -122,10 +122,10 @@ class ContextService:
         self._roll_day(today)
 
         prev_levels_loaded = False
-        if self.settings.data_source.lower() == "hft_connector":
-            logger.info("Backfill: Using dynamic range with cache (HFT connector)")
-            # Continue with normal backfill flow (don't return/skip)
-        if self.settings.context_backfill_enabled:
+        data_source_lower = self.settings.data_source.lower()
+        if data_source_lower in ("hft_connector", "bybit_connector"):
+            logger.info("Backfill: skipped (using %s for live data)", data_source_lower)
+        elif self.settings.context_backfill_enabled:
             try:
                 prev_levels_loaded = await self._perform_backfill(now)
             except Exception as exc:  # pragma: no cover - diagnostic logging
