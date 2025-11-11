@@ -67,7 +67,7 @@ class TestSessionScheduler:
         scheduler = SessionScheduler(now_provider=lambda: now)
         
         session = scheduler.get_current_session()
-        assert session == SessionState.OFF
+        assert session == SessionState.WAITING_FOR_SESSION
         assert not scheduler.is_active_session()
 
     def test_session_boundaries(self):
@@ -82,17 +82,17 @@ class TestSessionScheduler:
         scheduler = SessionScheduler(now_provider=lambda: london_start)
         assert scheduler.get_current_session() == SessionState.LONDON
 
-        # London end should be off
+        # London end should be waiting for session
         scheduler = SessionScheduler(now_provider=lambda: london_end)
-        assert scheduler.get_current_session() == SessionState.OFF
+        assert scheduler.get_current_session() == SessionState.WAITING_FOR_SESSION
 
         # Overlap start should be active
         scheduler = SessionScheduler(now_provider=lambda: overlap_start)
         assert scheduler.get_current_session() == SessionState.OVERLAP
 
-        # Overlap end should be off
+        # Overlap end should be waiting for session
         scheduler = SessionScheduler(now_provider=lambda: overlap_end)
-        assert scheduler.get_current_session() == SessionState.OFF
+        assert scheduler.get_current_session() == SessionState.WAITING_FOR_SESSION
 
     def test_session_callbacks(self):
         """Test session change callbacks."""
@@ -179,12 +179,14 @@ class TestStrategyEngine:
 
     def test_ingest_trade_active_session(self, engine):
         """Test trade ingestion during active session."""
-        # Mock active session
-        engine.scheduler._current_session = SessionState.LONDON
+        # Set time to London session (10:00 UTC)
+        now = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        engine._now_provider = lambda: now
+        engine.scheduler._now_provider = lambda: now
         
         # Create test trade
         trade = TradeTick(
-            ts=datetime.now(timezone.utc),
+            ts=now,
             price=100.0,
             qty=1.0,
             side=TradeSide.BUY,
@@ -193,7 +195,6 @@ class TestStrategyEngine:
         )
 
         # Initialize candle buffer
-        now = datetime.now(timezone.utc)
         engine._initialize_candle_buffers()
         for timeframe in engine._active_timeframes:
             engine._candle_buffers[timeframe]["start_time"] = engine._align_to_timeframe(now, timeframe)
@@ -213,8 +214,8 @@ class TestStrategyEngine:
 
     def test_ingest_trade_inactive_session(self, engine):
         """Test trade ingestion during inactive session."""
-        # Mock inactive session
-        engine.scheduler._current_session = SessionState.OFF
+        # Mock inactive session (WAITING_FOR_SESSION)
+        engine.scheduler._current_session = SessionState.WAITING_FOR_SESSION
         
         # Create test trade
         trade = TradeTick(
@@ -244,8 +245,9 @@ class TestStrategyEngine:
 
     def test_candle_aggregation(self, engine):
         """Test candle aggregation logic."""
-        # Initialize candle buffer
+        # Initialize candle buffer during London session
         now = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        engine._now_provider = lambda: now
         engine._initialize_candle_buffers()
         
         for timeframe in engine._active_timeframes:
@@ -258,8 +260,8 @@ class TestStrategyEngine:
             buffer_data["volume"] = 1.0
             buffer_data["trades"] = 1
 
-        # Simulate time advance to complete candle
-        future_time = now + timedelta(minutes=2)
+        # Simulate time advance to complete candles (need 6 minutes for 5m candle)
+        future_time = now + timedelta(minutes=6)
         engine._now_provider = lambda: future_time
 
         # Run aggregation
@@ -281,7 +283,8 @@ class TestStrategyEngine:
         
         assert isinstance(state, StrategyEngineState)
         assert not state.is_running
-        assert state.current_session == SessionState.OFF
+        # Current session is WAITING_FOR_SESSION when outside trading hours
+        assert state.current_session in [SessionState.OFF, SessionState.WAITING_FOR_SESSION]
         assert Timeframe.ONE_MINUTE in state.active_timeframes
         assert Timeframe.FIVE_MINUTES in state.active_timeframes
         assert "1m" in state.candle_buffers

@@ -19,6 +19,7 @@ class SessionState(str, Enum):
     OFF = "off"
     LONDON = "london"
     OVERLAP = "overlap"
+    WAITING_FOR_SESSION = "waiting_for_session"
 
 
 class MarketRegime(str, Enum):
