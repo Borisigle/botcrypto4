@@ -123,7 +123,7 @@ class ContextService:
 
         prev_levels_loaded = False
         data_source_lower = self.settings.data_source.lower()
-        if data_source_lower in ("hft_connector", "bybit_connector"):
+        if data_source_lower == "hft_connector":
             logger.info("Backfill: skipped (using %s for live data)", data_source_lower)
         elif self.settings.context_backfill_enabled:
             try:
@@ -420,7 +420,8 @@ class ContextService:
     def _get_history_provider(self) -> Optional[TradeHistoryProvider]:
         if self._history_provider is None:
             # Choose provider based on configuration
-            if self.settings.data_source.lower() == "bybit":
+            data_source_lower = self.settings.data_source.lower()
+            if data_source_lower in ("bybit", "bybit_connector"):
                 logger.info("Using BybitConnectorHistory for backfill")
                 self._history_provider = BybitConnectorHistory(self.settings)
             else:
