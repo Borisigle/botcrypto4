@@ -147,6 +147,37 @@ class Settings:
     connector_paper_trading: bool = field(
         default_factory=lambda: _env_bool("CONNECTOR_PAPER_TRADING", "true")
     )
+    # Bybit API configuration (for backfill)
+    bybit_api_key: Optional[str] = field(
+        default_factory=lambda: os.getenv("BYBIT_API_KEY")
+    )
+    bybit_api_secret: Optional[str] = field(
+        default_factory=lambda: os.getenv("BYBIT_API_SECRET")
+    )
+    bybit_rest_base_url: str = field(
+        default_factory=lambda: os.getenv("BYBIT_REST_BASE_URL", "https://api.bybit.com")
+    )
+    bybit_api_timeout: int = field(
+        default_factory=lambda: int(os.getenv("BYBIT_API_TIMEOUT", "30"))
+    )
+    bybit_backfill_max_retries: int = field(
+        default_factory=lambda: int(os.getenv("BYBIT_BACKFILL_MAX_RETRIES", "5"))
+    )
+    bybit_backfill_retry_base: float = field(
+        default_factory=lambda: float(os.getenv("BYBIT_BACKFILL_RETRY_BASE", "0.5"))
+    )
+    bybit_backfill_rate_limit_threshold: int = field(
+        default_factory=lambda: int(os.getenv("BYBIT_BACKFILL_RATE_LIMIT_THRESHOLD", "3"))
+    )
+    bybit_backfill_cooldown_seconds: int = field(
+        default_factory=lambda: int(os.getenv("BYBIT_BACKFILL_COOLDOWN_SECONDS", "60"))
+    )
+    bybit_backfill_public_delay_ms: int = field(
+        default_factory=lambda: int(os.getenv("BYBIT_BACKFILL_PUBLIC_DELAY_MS", "50"))
+    )
+    bybit_backfill_max_concurrent_chunks: int = field(
+        default_factory=lambda: int(os.getenv("BYBIT_BACKFILL_MAX_CONCURRENT_CHUNKS", "8"))
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
