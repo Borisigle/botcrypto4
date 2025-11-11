@@ -12,11 +12,11 @@ from .models import SessionState
 class SessionScheduler:
     """Manages trading session windows and component activation."""
 
-    # Session time windows (UTC)
-    LONDON_START = time(hour=8, minute=0, tzinfo=timezone.utc)
-    LONDON_END = time(hour=12, minute=0, tzinfo=timezone.utc)
-    OVERLAP_START = time(hour=13, minute=0, tzinfo=timezone.utc)
-    OVERLAP_END = time(hour=17, minute=0, tzinfo=timezone.utc)
+    # Session time windows (UTC) - use naive time objects for comparison
+    LONDON_START = time(hour=8, minute=0)
+    LONDON_END = time(hour=12, minute=0)
+    OVERLAP_START = time(hour=13, minute=0)
+    OVERLAP_END = time(hour=17, minute=0)
 
     def __init__(self, now_provider: Optional[Callable[[], datetime]] = None) -> None:
         self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
@@ -76,7 +76,8 @@ class SessionScheduler:
     def _update_current_session(self) -> None:
         """Update the current session state based on current time."""
         now = self._now_provider()
-        current_time = now.time()
+        # Extract time in UTC timezone
+        current_time = now.astimezone(timezone.utc).time()
         previous_session = self._current_session
 
         # Determine session based on time windows
@@ -85,11 +86,17 @@ class SessionScheduler:
         elif self.OVERLAP_START <= current_time < self.OVERLAP_END:
             self._current_session = SessionState.OVERLAP
         else:
-            self._current_session = SessionState.OFF
+            self._current_session = SessionState.WAITING_FOR_SESSION
 
         # Notify callbacks if session changed
         if previous_session != self._current_session:
             self._notify_session_change(previous_session, self._current_session)
+            
+            # Log waiting state
+            if self._current_session == SessionState.WAITING_FOR_SESSION:
+                logging.info(
+                    "⏳ WAITING FOR LONDON SESSION (08:00-12:00 UTC) OR NY OVERLAP (13:00-17:00 UTC) - NO TRADING NOW"
+                )
 
     def _notify_session_change(self, old_session: SessionState, new_session: SessionState) -> None:
         """Notify all callbacks of a session state change."""
@@ -120,35 +127,40 @@ class SessionScheduler:
 
     def get_session_info(self) -> dict:
         """Get detailed session information."""
+        # Update session state first
+        self._update_current_session()
+        
         now = self._now_provider()
-        current_time = now.time()
+        # Convert to UTC for consistent time comparison
+        now_utc = now.astimezone(timezone.utc)
+        current_time = now_utc.time()
 
         # Calculate time to next session change
         time_to_change = None
-        if self._current_session == SessionState.OFF:
+        if self._current_session in (SessionState.OFF, SessionState.WAITING_FOR_SESSION):
             # Find next session start
             if current_time < self.LONDON_START:
                 time_to_change = datetime.combine(
-                    now.date(), self.LONDON_START, timezone.utc
-                ) - now
+                    now_utc.date(), self.LONDON_START, timezone.utc
+                ) - now_utc
             elif current_time < self.OVERLAP_START:
                 time_to_change = datetime.combine(
-                    now.date(), self.OVERLAP_START, timezone.utc
-                ) - now
+                    now_utc.date(), self.OVERLAP_START, timezone.utc
+                ) - now_utc
             else:
                 # Next day's London session
-                tomorrow = now.date() + datetime.timedelta(days=1)
+                tomorrow = now_utc.date() + timedelta(days=1)
                 time_to_change = datetime.combine(
                     tomorrow, self.LONDON_START, timezone.utc
-                ) - now
+                ) - now_utc
         elif self._current_session == SessionState.LONDON:
             # Time to overlap start
-            change_time = datetime.combine(now.date(), self.OVERLAP_START, timezone.utc)
-            time_to_change = change_time - now
+            change_time = datetime.combine(now_utc.date(), self.OVERLAP_START, timezone.utc)
+            time_to_change = change_time - now_utc
         elif self._current_session == SessionState.OVERLAP:
             # Time to session end
-            change_time = datetime.combine(now.date(), self.OVERLAP_END, timezone.utc)
-            time_to_change = change_time - now
+            change_time = datetime.combine(now_utc.date(), self.OVERLAP_END, timezone.utc)
+            time_to_change = change_time - now_utc
 
         return {
             "current_session": self._current_session.value,

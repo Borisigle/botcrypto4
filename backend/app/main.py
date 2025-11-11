@@ -64,6 +64,23 @@ async def shutdown_event() -> None:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    """Return basic service status."""
-    return {"status": "ok"}
+async def health() -> dict:
+    """Return basic service status including session information."""
+    engine = get_strategy_engine()
+    scheduler_state = engine.scheduler.get_session_info()
+    
+    # Map session state to frontend-friendly message
+    session_status = scheduler_state.get("current_session", "off")
+    status_messages = {
+        "london": "🇬🇧 LONDON SESSION ACTIVE (08:00-12:00 UTC)",
+        "overlap": "🌍 NY OVERLAP ACTIVE (13:00-17:00 UTC)",
+        "waiting_for_session": "⏳ ESPERANDO LONDON - NO OPERAR",
+        "off": "⏳ NO SESSION",
+    }
+    
+    return {
+        "status": "ok",
+        "session": session_status,
+        "session_message": status_messages.get(session_status, "Unknown"),
+        "is_trading_active": scheduler_state.get("is_active", False),
+    }
