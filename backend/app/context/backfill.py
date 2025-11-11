@@ -637,6 +637,14 @@ class BinanceTradeHistory:
         
         chunks = self._split_time_range(start_dt, end_dt, self.chunk_minutes)
         
+        # Track failed chunks for retry and adaptive concurrency
+        failed_chunk_indices = []
+        rate_limit_errors = 0
+        # Use adaptive concurrency: start with 3, reduce to 1 if 429 errors spike
+        base_concurrency = 3
+        current_concurrency = base_concurrency
+        current_request_delay = self.request_delay
+        
         logger.info(
             "Backfill: %d chunks (%d min each), adaptive concurrency (start: %d) from %s to %s",
             len(chunks),
@@ -645,14 +653,6 @@ class BinanceTradeHistory:
             start_dt.isoformat(),
             end_dt.isoformat(),
         )
-        
-        # Track failed chunks for retry and adaptive concurrency
-        failed_chunk_indices = []
-        rate_limit_errors = 0
-        # Use adaptive concurrency: start with 3, reduce to 1 if 429 errors spike
-        base_concurrency = 3
-        current_concurrency = base_concurrency
-        current_request_delay = self.request_delay
         
         semaphore = asyncio.Semaphore(current_concurrency)
         
