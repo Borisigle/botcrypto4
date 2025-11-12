@@ -4,14 +4,23 @@ import { useEffect, useId, useMemo, useState } from 'react';
 import type {
   ContextResponse,
   HealthResult,
+  MetricsResponse,
   PricePayload,
   SessionState,
-  WsHealth,
+  WsHealthExtended,
 } from './types';
+import {
+  fetchContext,
+  fetchHealthStatus,
+  fetchMetrics,
+  fetchPrice,
+  fetchWsHealth,
+} from './api-client';
 
 const CONTEXT_POLL_INTERVAL = 7000;
-const HEALTH_POLL_INTERVAL = 12000;
-const PRICE_POLL_INTERVAL = 3000;
+const HEALTH_POLL_INTERVAL = 5000;
+const METRICS_POLL_INTERVAL = 2000;
+const PRICE_POLL_INTERVAL = 1000;
 const MAX_PRICE_POINTS = 240;
 
 const SESSION_LABELS: Record<SessionState['state'], string> = {
@@ -32,8 +41,9 @@ type DashboardClientProps = {
   baseUrl: string;
   initialContext: ContextResponse | null;
   initialHealth: HealthResult | null;
-  initialWsHealth: WsHealth | null;
+  initialWsHealth: WsHealthExtended | null;
   initialPrice: PricePayload | null;
+  initialMetrics: MetricsResponse | null;
 };
 
 type PricePoint = {
@@ -99,6 +109,20 @@ function formatSigned(value: number | null | undefined): string {
   return `${prefix}${magnitude}`;
 }
 
+function formatVolume(value: number | null | undefined): string {
+  if (!isNumber(value)) {
+    return 'N/A';
+  }
+  const numeric = value as number;
+  if (numeric >= 1000000) {
+    return `${(numeric / 1000000).toFixed(2)}M`;
+  }
+  if (numeric >= 1000) {
+    return `${(numeric / 1000).toFixed(2)}K`;
+  }
+  return numeric.toFixed(2);
+}
+
 function safeDate(source: string | null | undefined): Date | null {
   if (!source) {
     return null;
@@ -161,36 +185,50 @@ function payloadToPoint(payload: PricePayload | null | undefined): PricePoint | 
   return { price: payload.price as number, ts };
 }
 
-function computeHealthSummary(health: HealthResult | null, ws: WsHealth | null): HealthSummary {
+function computeHealthSummary(
+  health: HealthResult | null,
+  ws: WsHealthExtended | null,
+): HealthSummary {
   const backendStatus = health?.status?.toLowerCase() ?? 'unknown';
   const backendOk = backendStatus === 'ok';
 
-  const connectionStates = [
-    ws?.trades != null ? ws.trades.connected : null,
-    ws?.depth != null ? ws.depth.connected : null,
-  ].filter((value): value is boolean => value !== null);
+  // Determine which health indicators to check
+  const hasConnector = ws?.connector != null;
+  const hasTrades = ws?.trades != null;
+  const hasDepth = ws?.depth != null;
 
-  const anyWsKnown = connectionStates.length > 0;
-  const anyWsDown = connectionStates.some((state) => !state);
-  const allWsDown = anyWsKnown && connectionStates.every((state) => !state);
+  let connectorConnected = false;
+  let tradesConnected = false;
+  let depthConnected = false;
 
-  const details: string[] = [
-    `API: ${backendOk ? 'OK' : backendStatus === 'unknown' ? 'Unknown' : health?.status ?? 'Unavailable'}`,
-    `Trades WS: ${
-      ws?.trades == null ? 'Unknown' : ws.trades.connected ? 'Connected' : 'Down'
-    }`,
-    `Depth WS: ${
-      ws?.depth == null ? 'Unknown' : ws.depth.connected ? 'Connected' : 'Down'
-    }`,
-  ];
+  if (hasConnector) {
+    connectorConnected = ws.connector?.connected ?? false;
+  }
+  if (hasTrades) {
+    tradesConnected = ws.trades?.connected ?? false;
+  }
+  if (hasDepth) {
+    depthConnected = ws.depth?.connected ?? false;
+  }
+
+  const details: string[] = [`API: ${backendOk ? 'OK' : backendStatus === 'unknown' ? 'Unknown' : health?.status ?? 'Unavailable'}`];
+
+  if (hasConnector) {
+    details.push(`Connector: ${connectorConnected ? 'Connected' : 'Down'}`);
+  } else {
+    details.push(`Trades WS: ${hasTrades ? (tradesConnected ? 'Connected' : 'Down') : 'Unknown'}`);
+    details.push(`Depth WS: ${hasDepth ? (depthConnected ? 'Connected' : 'Down') : 'Unknown'}`);
+  }
 
   let level: HealthLevel;
 
-  if (backendOk && !anyWsDown) {
-    level = anyWsKnown || backendStatus !== 'unknown' ? 'ok' : 'unknown';
-  } else if (!backendOk && backendStatus !== 'unknown' && (allWsDown || !anyWsKnown)) {
+  const anyDown = connectorConnected === false || tradesConnected === false || depthConnected === false;
+
+  if (backendOk && !anyDown) {
+    level = hasConnector || hasTrades || hasDepth ? 'ok' : 'unknown';
+  } else if (!backendOk && backendStatus !== 'unknown' && anyDown) {
     level = 'down';
-  } else if (!backendOk || anyWsDown) {
+  } else if (!backendOk || anyDown) {
     level = 'degraded';
   } else {
     level = 'unknown';
@@ -355,7 +393,202 @@ function PriceChart({ points, overlays }: PriceChartProps) {
           )}
         </svg>
       )}
-      {(!chart.scaleReady || chart.showEmpty) && <div className="chart__empty">Waiting for price data…</div>}
+      {(!chart.scaleReady || chart.showEmpty) && (
+        <div className="chart__empty">Waiting for price data…</div>
+      )}
+    </div>
+  );
+}
+
+function MetricsPanel({ metrics }: { metrics: MetricsResponse | null }) {
+  const metricsData = metrics?.metrics;
+  const lastUpdate = metrics?.metadata?.last_update;
+
+  return (
+    <div className="panel metrics-card">
+      <div className="panel__header">
+        <h2>Live Metrics</h2>
+        {lastUpdate && <span className="panel__meta">Updated: {formatIsoTime(lastUpdate)}</span>}
+      </div>
+      {metricsData ? (
+        <div className="metrics-grid">
+          <div className="metrics-item">
+            <span className="metrics-label">VWAP</span>
+            <span className="metrics-value metrics-value--vwap">{formatPrice(metricsData.vwap)}</span>
+          </div>
+          <div className="metrics-item">
+            <span className="metrics-label">POC</span>
+            <span className="metrics-value metrics-value--poc">{formatPrice(metricsData.poc)}</span>
+          </div>
+          <div className="metrics-item">
+            <span className="metrics-label">Delta</span>
+            <span
+              className={`metrics-value ${
+                isNumber(metricsData.delta)
+                  ? metricsData.delta < 0
+                    ? 'metrics-value--negative'
+                    : metricsData.delta > 0
+                    ? 'metrics-value--positive'
+                    : ''
+                  : ''
+              }`}
+            >
+              {formatSigned(metricsData.delta)}
+            </span>
+          </div>
+          <div className="metrics-item">
+            <span className="metrics-label">Buy Vol</span>
+            <span className="metrics-value metrics-value--buy">{formatVolume(metricsData.buy_volume)}</span>
+          </div>
+          <div className="metrics-item">
+            <span className="metrics-label">Sell Vol</span>
+            <span className="metrics-value metrics-value--sell">{formatVolume(metricsData.sell_volume)}</span>
+          </div>
+          <div className="metrics-item">
+            <span className="metrics-label">Trades</span>
+            <span className="metrics-value">{metricsData.trade_count}</span>
+          </div>
+        </div>
+      ) : (
+        <p className="panel__muted">No metrics data available yet.</p>
+      )}
+    </div>
+  );
+}
+
+function SessionPanel({ context }: { context: ContextResponse | null }) {
+  const session = context?.session ?? DEFAULT_SESSION;
+
+  const getSessionColor = () => {
+    switch (session.state) {
+      case 'london':
+        return 'session-panel--london';
+      case 'overlap':
+        return 'session-panel--overlap';
+      default:
+        return 'session-panel--off';
+    }
+  };
+
+  return (
+    <div className={`panel session-panel ${getSessionColor()}`}>
+      <div className="panel__header">
+        <h2>Trading Session</h2>
+      </div>
+      <div className="session-info">
+        <div className="session-info__item">
+          <span className="session-info__label">Current Session</span>
+          <span className="session-info__value">{SESSION_LABELS[session.state]}</span>
+        </div>
+        <div className="session-info__item">
+          <span className="session-info__label">Time (UTC)</span>
+          <span className="session-info__value">{formatIsoTime(session.nowUtc)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConnectorHealthPanel({ wsHealth }: { wsHealth: WsHealthExtended | null }) {
+  const hasConnector = wsHealth?.connector != null;
+  const hasTrades = wsHealth?.trades != null;
+  const hasDepth = wsHealth?.depth != null;
+
+  return (
+    <div className="panel health-card">
+      <div className="panel__header">
+        <h2>Connector Health</h2>
+      </div>
+      {hasConnector ? (
+        <div className="health-items">
+          <div className="health-item">
+            <span className="health-label">Status</span>
+            <span
+              className={`health-badge ${
+                wsHealth?.connector?.connected ? 'health-badge--connected' : 'health-badge--disconnected'
+              }`}
+            >
+              {wsHealth?.connector?.connected ? '● Connected' : '● Disconnected'}
+            </span>
+          </div>
+          {wsHealth?.connector?.last_ts && (
+            <div className="health-item">
+              <span className="health-label">Last Update</span>
+              <span className="health-value">{formatIsoTime(wsHealth.connector.last_ts)}</span>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="health-items">
+          <div className="health-item">
+            <span className="health-label">Trades</span>
+            <span
+              className={`health-badge ${
+                wsHealth?.trades?.connected ? 'health-badge--connected' : 'health-badge--disconnected'
+              }`}
+            >
+              {wsHealth?.trades?.connected ? '● Connected' : '● Disconnected'}
+            </span>
+          </div>
+          <div className="health-item">
+            <span className="health-label">Depth</span>
+            <span
+              className={`health-badge ${
+                wsHealth?.depth?.connected ? 'health-badge--connected' : 'health-badge--disconnected'
+              }`}
+            >
+              {wsHealth?.depth?.connected ? '● Connected' : '● Disconnected'}
+            </span>
+          </div>
+          {wsHealth?.trades?.last_ts && (
+            <div className="health-item">
+              <span className="health-label">Last Trade</span>
+              <span className="health-value">{formatIsoTime(wsHealth.trades.last_ts)}</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FootprintPanel({ metrics }: { metrics: MetricsResponse | null }) {
+  const footprint = metrics?.metrics?.footprint ?? [];
+  const topEntries = footprint.slice(0, 8);
+
+  return (
+    <div className="panel footprint-card">
+      <div className="panel__header">
+        <h2>Volume Footprint (Top 8)</h2>
+      </div>
+      {topEntries.length > 0 ? (
+        <div className="footprint-table">
+          {topEntries.map((entry) => {
+            const total = entry.buy_vol + entry.sell_vol;
+            const buyRatio = total > 0 ? (entry.buy_vol / total) * 100 : 0;
+            return (
+              <div key={entry.price} className="footprint-row">
+                <div className="footprint-price">{formatPrice(entry.price)}</div>
+                <div className="footprint-volume">{formatVolume(entry.volume)}</div>
+                <div className="footprint-bar">
+                  <div
+                    className="footprint-bar__buy"
+                    style={{ width: `${buyRatio}%` }}
+                    title={`Buy: ${formatVolume(entry.buy_vol)}`}
+                  />
+                  <div
+                    className="footprint-bar__sell"
+                    style={{ width: `${100 - buyRatio}%` }}
+                    title={`Sell: ${formatVolume(entry.sell_vol)}`}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="panel__muted">No footprint data available yet.</p>
+      )}
     </div>
   );
 }
@@ -366,14 +599,16 @@ export default function DashboardClient({
   initialHealth,
   initialWsHealth,
   initialPrice,
+  initialMetrics,
 }: DashboardClientProps): JSX.Element {
   const [context, setContext] = useState<ContextResponse | null>(initialContext);
   const [health, setHealth] = useState<HealthResult | null>(initialHealth);
-  const [wsHealth, setWsHealth] = useState<WsHealth | null>(initialWsHealth);
+  const [wsHealth, setWsHealth] = useState<WsHealthExtended | null>(initialWsHealth);
   const [pricePoints, setPricePoints] = useState<PricePoint[]>(() => {
     const point = payloadToPoint(initialPrice ?? initialContext?.price ?? null);
     return point ? [point] : [];
   });
+  const [metrics, setMetrics] = useState<MetricsResponse | null>(initialMetrics);
 
   const session = context?.session ?? DEFAULT_SESSION;
   const [utcClock, setUtcClock] = useState<Date>(() => safeDate(session.nowUtc) ?? new Date());
@@ -397,49 +632,48 @@ export default function DashboardClient({
     return () => window.clearInterval(timer);
   }, []);
 
+  // Fetch context
   useEffect(() => {
     let active = true;
 
-    const fetchContext = async () => {
+    const fetchContextData = async () => {
       try {
-        const response = await fetch(`${baseUrl}/context`, { cache: 'no-store' });
-        if (!response.ok) {
-          return;
-        }
-        const data = (await response.json()) as ContextResponse;
+        const data = await fetchContext(baseUrl);
         if (!active) {
           return;
         }
-        setContext(data);
+        if (data) {
+          setContext(data);
+        }
       } catch (error) {
         console.warn('context_fetch_error', error);
       }
     };
 
-    const interval = window.setInterval(fetchContext, CONTEXT_POLL_INTERVAL);
-    fetchContext();
+    const interval = window.setInterval(fetchContextData, CONTEXT_POLL_INTERVAL);
     return () => {
       active = false;
       window.clearInterval(interval);
     };
   }, [baseUrl]);
 
+  // Fetch health
   useEffect(() => {
     let active = true;
 
-    const fetchHealth = async () => {
+    const fetchHealthData = async () => {
       try {
         const [healthResponse, wsResponse] = await Promise.all([
-          fetch(`${baseUrl}/health`, { cache: 'no-store' }),
-          fetch(`${baseUrl}/ws/health`, { cache: 'no-store' }),
+          fetchHealthStatus(baseUrl),
+          fetchWsHealth(baseUrl),
         ]);
 
         if (active) {
-          if (healthResponse.ok) {
-            setHealth((await healthResponse.json()) as HealthResult);
+          if (healthResponse) {
+            setHealth(healthResponse);
           }
-          if (wsResponse.ok) {
-            setWsHealth((await wsResponse.json()) as WsHealth);
+          if (wsResponse) {
+            setWsHealth(wsResponse);
           }
         }
       } catch (error) {
@@ -447,52 +681,68 @@ export default function DashboardClient({
       }
     };
 
-    const interval = window.setInterval(fetchHealth, HEALTH_POLL_INTERVAL);
-    fetchHealth();
-
+    const interval = window.setInterval(fetchHealthData, HEALTH_POLL_INTERVAL);
     return () => {
       active = false;
       window.clearInterval(interval);
     };
   }, [baseUrl]);
 
+  // Fetch metrics
   useEffect(() => {
     let active = true;
 
-    const fetchPrice = async () => {
+    const fetchMetricsData = async () => {
       try {
-        const response = await fetch(`${baseUrl}/price`, { cache: 'no-store' });
-        if (!response.ok) {
-          return;
+        const data = await fetchMetrics(baseUrl);
+        if (active && data) {
+          setMetrics(data);
         }
-        const payload = (await response.json()) as PricePayload;
-        if (!active) {
-          return;
-        }
-        const point = payloadToPoint(payload);
-        if (point) {
-          setPricePoints((prev) => appendPricePoint(prev, point));
+      } catch (error) {
+        console.warn('metrics_fetch_error', error);
+      }
+    };
+
+    const interval = window.setInterval(fetchMetricsData, METRICS_POLL_INTERVAL);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [baseUrl]);
+
+  // Fetch price
+  useEffect(() => {
+    let active = true;
+
+    const fetchPriceData = async () => {
+      try {
+        const payload = await fetchPrice(baseUrl);
+        if (active && payload) {
+          const point = payloadToPoint(payload);
+          if (point) {
+            setPricePoints((prev) => appendPricePoint(prev, point));
+          }
         }
       } catch (error) {
         console.warn('price_fetch_error', error);
       }
     };
 
-    const interval = window.setInterval(fetchPrice, PRICE_POLL_INTERVAL);
-    fetchPrice();
-
+    const interval = window.setInterval(fetchPriceData, PRICE_POLL_INTERVAL);
     return () => {
       active = false;
       window.clearInterval(interval);
     };
   }, [baseUrl]);
 
+  // Update price from context
   useEffect(() => {
     const point = payloadToPoint(context?.price);
     if (point) {
       setPricePoints((prev) => appendPricePoint(prev, point));
     }
-  }, [context?.price?.price, context?.price?.ts]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [context?.price]);
 
   const overlayLines = useMemo<OverlayLine[]>(() => {
     const levels = context?.levels;
@@ -514,25 +764,61 @@ export default function DashboardClient({
         lines.push({ id: 'OR_HI', label: 'OR High', value: levels.OR.hi as number, color: '#facc15' });
       }
       if (isNumber(levels.OR.lo)) {
-        lines.push({ id: 'OR_LO', label: 'OR Low', value: levels.OR.lo as number, color: '#facc15', dashed: true });
+        lines.push({
+          id: 'OR_LO',
+          label: 'OR Low',
+          value: levels.OR.lo as number,
+          color: '#facc15',
+          dashed: true,
+        });
       }
     }
 
     const prevColor = '#cbd5f5';
     if (isNumber(levels.PDH)) {
-      lines.push({ id: 'PDH', label: 'Prev Day High', value: levels.PDH as number, color: prevColor, dashed: true });
+      lines.push({
+        id: 'PDH',
+        label: 'Prev Day High',
+        value: levels.PDH as number,
+        color: prevColor,
+        dashed: true,
+      });
     }
     if (isNumber(levels.PDL)) {
-      lines.push({ id: 'PDL', label: 'Prev Day Low', value: levels.PDL as number, color: prevColor, dashed: true });
+      lines.push({
+        id: 'PDL',
+        label: 'Prev Day Low',
+        value: levels.PDL as number,
+        color: prevColor,
+        dashed: true,
+      });
     }
     if (isNumber(levels.VAHprev)) {
-      lines.push({ id: 'VAHprev', label: 'Prev VAH', value: levels.VAHprev as number, color: prevColor, dashed: true });
+      lines.push({
+        id: 'VAHprev',
+        label: 'Prev VAH',
+        value: levels.VAHprev as number,
+        color: prevColor,
+        dashed: true,
+      });
     }
     if (isNumber(levels.VALprev)) {
-      lines.push({ id: 'VALprev', label: 'Prev VAL', value: levels.VALprev as number, color: prevColor, dashed: true });
+      lines.push({
+        id: 'VALprev',
+        label: 'Prev VAL',
+        value: levels.VALprev as number,
+        color: prevColor,
+        dashed: true,
+      });
     }
     if (isNumber(levels.POCprev)) {
-      lines.push({ id: 'POCprev', label: 'Prev POC', value: levels.POCprev as number, color: prevColor, dashed: true });
+      lines.push({
+        id: 'POCprev',
+        label: 'Prev POC',
+        value: levels.POCprev as number,
+        color: prevColor,
+        dashed: true,
+      });
     }
 
     return lines;
@@ -571,7 +857,9 @@ export default function DashboardClient({
       <header className="dashboard__header">
         <div>
           <h1 className="dashboard__title">Botcrypto4</h1>
-          <p className="dashboard__subtitle">Live trading context dashboard with session awareness and price overlays.</p>
+          <p className="dashboard__subtitle">
+            Live trading context dashboard with real-time metrics and session awareness.
+          </p>
         </div>
         <div className="session-status">
           <span className={SESSION_BADGE_CLASS[session.state]}>{SESSION_LABELS[session.state]}</span>
@@ -583,7 +871,14 @@ export default function DashboardClient({
         <span className="health-banner__dot" aria-hidden />
         <div className="health-banner__content">
           <span className="health-banner__summary">
-            System health: {healthSummary.level === 'ok' ? 'Operational' : healthSummary.level === 'down' ? 'Down' : healthSummary.level === 'degraded' ? 'Degraded' : 'Unknown'}
+            System health:{' '}
+            {healthSummary.level === 'ok'
+              ? 'Operational'
+              : healthSummary.level === 'down'
+              ? 'Down'
+              : healthSummary.level === 'degraded'
+              ? 'Degraded'
+              : 'Unknown'}
           </span>
           <div className="health-banner__details">
             {healthSummary.details.map((detail) => (
@@ -597,7 +892,7 @@ export default function DashboardClient({
         <section className="panel chart-card">
           <div className="chart-card__header">
             <div>
-              <h2>BTC Context</h2>
+              <h2>BTC Price Context</h2>
               <p className="price-meta">Last update: {lastUpdateLabel}</p>
             </div>
             <div className="price-value">{formatPrice(latestPrice)}</div>
@@ -624,7 +919,9 @@ export default function DashboardClient({
               <div className="levels-meta">
                 <span>
                   Opening range window:{' '}
-                  {levels.OR ? `${formatIsoTime(levels.OR.startTs)} → ${formatIsoTime(levels.OR.endTs)}` : '—'}
+                  {levels.OR
+                    ? `${formatIsoTime(levels.OR.startTs)} → ${formatIsoTime(levels.OR.endTs)}`
+                    : '—'}
                 </span>
               </div>
               {stats && (
@@ -658,23 +955,12 @@ export default function DashboardClient({
         </aside>
       </div>
 
-      <section className="panel signals-card">
-        <div className="panel__header">
-          <h2>Signals</h2>
-        </div>
-        <div className="signals-board">
-          <div className="signals-board__header">
-            <span>Time</span>
-            <span>Setup</span>
-            <span>Confluence</span>
-            <span>Entry / SL / TPs</span>
-            <span>R:R</span>
-          </div>
-          <div className="signals-empty">
-            <p>No signals yet. Waiting for setup conditions…</p>
-          </div>
-        </div>
-      </section>
+      <div className="dashboard__panels">
+        <MetricsPanel metrics={metrics} />
+        <SessionPanel context={context} />
+        <ConnectorHealthPanel wsHealth={wsHealth} />
+        <FootprintPanel metrics={metrics} />
+      </div>
     </main>
   );
 }
