@@ -138,6 +138,9 @@ class Settings:
     data_source: str = field(
         default_factory=lambda: os.getenv("DATA_SOURCE", "binance_ws")
     )
+    backfill_provider: Optional[str] = field(
+        default_factory=lambda: os.getenv("BACKFILL_PROVIDER")
+    )
     connector_name: Optional[str] = field(
         default_factory=lambda: os.getenv("CONNECTOR_NAME")
     )

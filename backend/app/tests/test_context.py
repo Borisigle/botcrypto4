@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.context.service import ContextService, SymbolExchangeInfo
+from app.context.backfill import BinanceTradeHistory, BybitConnectorHistory
 from app.context.price_bins import quantize_price_to_tick, get_effective_tick_size, validate_tick_size, PriceBinningError
 from app.ws.models import Settings, TradeSide, TradeTick
 
@@ -727,3 +728,45 @@ async def test_backfill_executed_with_bybit_connector(caplog) -> None:
     assert any("Backfill complete:" in record.message for record in caplog.records)
     
     await service.shutdown()
+
+
+def test_history_provider_override_uses_binance() -> None:
+    settings = Settings(
+        data_source="bybit",
+        backfill_provider="binance",
+    )
+    service = ContextService(
+        settings=settings,
+        fetch_exchange_info=False,
+    )
+
+    provider = service._get_history_provider()
+    assert isinstance(provider, BinanceTradeHistory)
+
+
+def test_history_provider_uses_connector_name_binance_hint() -> None:
+    settings = Settings(
+        data_source="bybit_connector",
+        connector_name="binance_hft",
+    )
+    service = ContextService(
+        settings=settings,
+        fetch_exchange_info=False,
+    )
+
+    provider = service._get_history_provider()
+    assert isinstance(provider, BinanceTradeHistory)
+
+
+def test_history_provider_uses_bybit_when_connector_name_matches() -> None:
+    settings = Settings(
+        data_source="binance_ws",
+        connector_name="bybit_primary",
+    )
+    service = ContextService(
+        settings=settings,
+        fetch_exchange_info=False,
+    )
+
+    provider = service._get_history_provider()
+    assert isinstance(provider, BybitConnectorHistory)
