@@ -489,6 +489,96 @@ function SessionPanel({ context }: { context: ContextResponse | null }) {
   );
 }
 
+function BackfillStatusPanel({ health, metrics }: { health: HealthResult | null; metrics: MetricsResponse | null }) {
+  const backfillComplete = health?.backfill_complete ?? false;
+  const backfillStatus = health?.backfill_status ?? 'idle';
+  const backfillProgress = health?.backfill_progress;
+  const tradingEnabled = health?.trading_enabled ?? false;
+  const metricsPrecision = health?.metrics_precision ?? (backfillComplete ? 'PRECISE' : 'UNKNOWN');
+
+  const tradingColor = tradingEnabled ? 'trading-badge--enabled' : 'trading-badge--disabled';
+
+  const statusClass = useMemo(() => {
+    switch (backfillStatus) {
+      case 'complete':
+        return 'backfill-status--complete';
+      case 'in_progress':
+        return 'backfill-status--progress';
+      case 'error':
+        return 'backfill-status--error';
+      case 'cancelled':
+        return 'backfill-status--cancelled';
+      case 'skipped':
+        return 'backfill-status--skipped';
+      case 'disabled':
+        return 'backfill-status--disabled';
+      default:
+        return 'backfill-status--idle';
+    }
+  }, [backfillStatus]);
+
+  return (
+    <div className="panel backfill-card">
+      <div className="panel__header">
+        <h2>Backfill & Trading Status</h2>
+      </div>
+      <div className="backfill-items">
+        <div className="backfill-item">
+          <span className="backfill-label">Trading</span>
+          <span className={`trading-badge ${tradingColor}`}>
+            {tradingEnabled ? '✅ ENABLED' : '❌ DISABLED'}
+          </span>
+        </div>
+        <div className="backfill-item">
+          <span className="backfill-label">Backfill Status</span>
+          <span className={`backfill-status ${statusClass}`}>
+            {backfillStatus === 'in_progress' ? '⏳ In Progress' : 
+             backfillStatus === 'complete' ? '✅ Complete' :
+             backfillStatus === 'skipped' ? '⏭️ Skipped' :
+             backfillStatus === 'disabled' ? '🚫 Disabled' :
+             backfillStatus === 'error' ? '❌ Error' :
+             backfillStatus === 'cancelled' ? '🛑 Cancelled' :
+             '⌛ Idle'}
+          </span>
+        </div>
+        {backfillProgress && backfillProgress.total > 0 && (
+          <>
+            <div className="backfill-item">
+              <span className="backfill-label">Progress</span>
+              <span className="backfill-value">
+                {backfillProgress.current}/{backfillProgress.total} chunks ({backfillProgress.percentage.toFixed(1)}%)
+              </span>
+            </div>
+            {backfillProgress.estimated_seconds_remaining != null && backfillProgress.estimated_seconds_remaining > 0 && (
+              <div className="backfill-item">
+                <span className="backfill-label">Est. Remaining</span>
+                <span className="backfill-value">{backfillProgress.estimated_seconds_remaining}s</span>
+              </div>
+            )}
+            <div className="backfill-progress-bar">
+              <div 
+                className="backfill-progress-fill" 
+                style={{ width: `${Math.min(100, backfillProgress.percentage)}%` }}
+              />
+            </div>
+          </>
+        )}
+        <div className="backfill-item">
+          <span className="backfill-label">Metrics Precision</span>
+          <span className={`metrics-precision ${backfillComplete ? 'metrics-precision--precise' : 'metrics-precision--imprecise'}`}>
+            {metricsPrecision}
+          </span>
+        </div>
+        {metrics?.metrics?.warning && (
+          <div className="backfill-warning">
+            ⚠️ {metrics.metrics.warning}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ConnectorHealthPanel({ wsHealth }: { wsHealth: WsHealthExtended | null }) {
   const hasConnector = wsHealth?.connector != null;
   const hasTrades = wsHealth?.trades != null;
@@ -958,6 +1048,7 @@ export default function DashboardClient({
       <div className="dashboard__panels">
         <MetricsPanel metrics={metrics} />
         <SessionPanel context={context} />
+        <BackfillStatusPanel health={health} metrics={metrics} />
         <ConnectorHealthPanel wsHealth={wsHealth} />
         <FootprintPanel metrics={metrics} />
       </div>
