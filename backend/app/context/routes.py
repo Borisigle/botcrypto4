@@ -44,3 +44,9 @@ async def debug_poc_view() -> dict:
 async def debug_exchange_info_view() -> dict:
     service = get_context_service()
     return service.debug_exchange_info_payload()
+
+
+@router.get("/backfill/status")
+async def backfill_status_view() -> dict:
+    service = get_context_service()
+    return service.get_backfill_status()

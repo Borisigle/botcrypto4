@@ -54,6 +54,7 @@ class ContextService:
 
         self._started = False
         self._periodic_task: Optional[asyncio.Task[None]] = None
+        self._backfill_task: Optional[asyncio.Task[None]] = None
         self._exchange_info_logged = False
 
         self.exchange_info: Optional[SymbolExchangeInfo] = exchange_info
@@ -121,24 +122,20 @@ class ContextService:
         today = now.date()
         self._roll_day(today)
 
-        prev_levels_loaded = False
         data_source_lower = self.settings.data_source.lower()
         if data_source_lower == "hft_connector":
             logger.info("Backfill: skipped (using %s for live data)", data_source_lower)
         elif self.settings.context_backfill_enabled:
-            try:
-                prev_levels_loaded = await self._perform_backfill(now)
-            except Exception as exc:  # pragma: no cover - diagnostic logging
-                logger.exception(
-                    "context_backfill_failed",
-                    extra={"error": str(exc)},
-                )
-
-        if not prev_levels_loaded and self.settings.context_bootstrap_prev_day:
-            prev_day = today - timedelta(days=1)
-            levels = self._load_previous_day(prev_day)
-            if levels:
-                self.prev_day_levels.update(levels)
+            # Run backfill in background to avoid blocking startup
+            logger.info("Starting backfill in background (non-blocking startup)...")
+            self._backfill_task = asyncio.create_task(self._run_backfill_background(now, today))
+        else:
+            # If backfill is disabled, try to load previous day synchronously
+            if self.settings.context_bootstrap_prev_day:
+                prev_day = today - timedelta(days=1)
+                levels = self._load_previous_day(prev_day)
+                if levels:
+                    self.prev_day_levels.update(levels)
 
         if self._periodic_task is None:
             self._periodic_task = asyncio.create_task(self._periodic_log_loop())
@@ -152,6 +149,13 @@ class ContextService:
             except asyncio.CancelledError:
                 pass
             self._periodic_task = None
+        if self._backfill_task is not None:
+            self._backfill_task.cancel()
+            try:
+                await self._backfill_task
+            except asyncio.CancelledError:
+                pass
+            self._backfill_task = None
 
     def ingest_trade(self, trade: TradeTick) -> None:
         trade_ts = trade.ts.astimezone(timezone.utc)
@@ -312,6 +316,43 @@ class ContextService:
         payload["raw"] = self.exchange_info.raw
         return payload
 
+    def get_backfill_status(self) -> Dict[str, Any]:
+        """Get the current status of background backfill."""
+        if self._backfill_task is None:
+            return {"status": "not_started", "running": False}
+        
+        if self._backfill_task.done():
+            # Check if it completed successfully or with an error
+            try:
+                self._backfill_task.result()
+                return {"status": "completed", "running": False}
+            except asyncio.CancelledError:
+                return {"status": "cancelled", "running": False}
+            except Exception as exc:
+                return {"status": "failed", "running": False, "error": str(exc)}
+        else:
+            return {"status": "running", "running": True}
+
+    async def wait_for_backfill(self, timeout: Optional[float] = None) -> bool:
+        """Wait for background backfill to complete. Returns True if successful, False otherwise."""
+        if self._backfill_task is None:
+            return True  # No backfill task, nothing to wait for
+        
+        try:
+            if timeout:
+                await asyncio.wait_for(self._backfill_task, timeout=timeout)
+            else:
+                await self._backfill_task
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Backfill wait timeout after {timeout}s")
+            return False
+        except asyncio.CancelledError:
+            return False
+        except Exception:
+            # Background task handles its own exceptions
+            return False
+
     def _session_state(self, now: datetime) -> Dict[str, Any]:
         current_time = now.timetz()
         start_london = time(hour=8, tzinfo=timezone.utc)
@@ -428,6 +469,32 @@ class ContextService:
                 logger.info("Using BinanceTradeHistory for backfill")
                 self._history_provider = BinanceTradeHistory(self.settings)
         return self._history_provider
+
+    async def _run_backfill_background(self, now: datetime, today: date) -> None:
+        """Run backfill in background without blocking startup."""
+        try:
+            logger.info("Background backfill: started")
+            prev_levels_loaded = await self._perform_backfill(now)
+            
+            # If backfill didn't load previous day levels, try loading from cache
+            if not prev_levels_loaded and self.settings.context_bootstrap_prev_day:
+                prev_day = today - timedelta(days=1)
+                levels = self._load_previous_day(prev_day)
+                if levels:
+                    self.prev_day_levels.update(levels)
+                    logger.info("Background backfill: loaded previous day from cache")
+            
+            logger.info("Background backfill: complete")
+        except asyncio.CancelledError:
+            logger.info("Background backfill: cancelled during shutdown")
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Background backfill: failed",
+                extra={"error": str(exc)},
+            )
+            # Don't crash the application - gracefully continue without backfill data
+            logger.warning("Application continues without historical backfill data")
 
     async def _perform_backfill(self, now: datetime) -> bool:
         provider = self._get_history_provider()

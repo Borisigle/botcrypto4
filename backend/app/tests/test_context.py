@@ -228,12 +228,19 @@ async def test_backfill_initializes_metrics_from_history() -> None:
         fetch_exchange_info=False,
     )
     await service.startup()
+    
+    # Wait for background backfill to complete
+    await service.wait_for_backfill(timeout=5.0)
 
     payload = service.context_payload()
     levels = payload["levels"]
     stats = payload["stats"]
 
-    expected_vwap = 722.0 / 7.0
+    # VWAP should only include trades before "now" (12:00), excluding the 13:00 trade
+    # Trades: 101*1 + 102*2 + 105*2 + 103*1 = 618
+    # Qty: 1 + 2 + 2 + 1 = 6
+    # VWAP = 618 / 6 = 103.0
+    expected_vwap = 618.0 / 6.0
     assert levels["VWAP"] == pytest.approx(expected_vwap)
     assert levels["POCd"] == pytest.approx(100.0)
     assert levels["PDH"] == pytest.approx(110.0)
@@ -702,6 +709,9 @@ async def test_backfill_executed_with_bybit_connector(caplog) -> None:
         fetch_exchange_info=False,
     )
     await service.startup()
+    
+    # Wait for background backfill to complete
+    await service.wait_for_backfill(timeout=5.0)
 
     # Verify that backfill WAS called (it's called for today's trades and previous day)
     # So we expect at least 1 call (today's backfill)
