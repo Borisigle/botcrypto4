@@ -111,7 +111,8 @@ class DepthStream(BaseStreamService):
 
     async def on_start(self) -> None:
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
-        await self._refresh_snapshot()
+        # Start snapshot refresh in background to avoid blocking startup
+        asyncio.create_task(self._refresh_snapshot_background())
 
     async def on_stop(self) -> None:
         if self._client:
@@ -157,6 +158,17 @@ class DepthStream(BaseStreamService):
             asks=len(update.asks),
         )
 
+    async def _refresh_snapshot_background(self) -> None:
+        """Refresh snapshot in background with error handling."""
+        try:
+            await self._refresh_snapshot()
+        except Exception as exc:
+            structured_log(
+                self.logger,
+                "depth_snapshot_background_failed",
+                error=str(exc),
+            )
+    
     async def _refresh_snapshot(self) -> None:
         if not self._client:
             raise DepthSyncError("HTTP client not initialized")
