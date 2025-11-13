@@ -65,9 +65,26 @@ async def shutdown_event() -> None:
 
 @app.get("/health")
 async def health() -> dict:
-    """Return basic service status including session information."""
+    """Return basic service status including session and backfill information."""
     engine = get_strategy_engine()
     scheduler_state = engine.scheduler.get_session_info()
+    
+    # Get backfill status
+    backfill_progress = context_service.backfill_progress.copy()
+    backfill_complete = context_service.backfill_complete
+    
+    # Determine if trading is enabled
+    is_session_active = scheduler_state.get("is_active", False)
+    trading_enabled = backfill_complete and is_session_active
+    
+    # Determine metrics precision
+    if not backfill_complete:
+        if backfill_progress.get("status") == "in_progress":
+            metrics_precision = f"IMPRECISE (backfill {backfill_progress.get('percentage', 0):.0f}%)"
+        else:
+            metrics_precision = "IMPRECISE (backfill pending)"
+    else:
+        metrics_precision = "PRECISE"
     
     # Map session state to frontend-friendly message
     session_status = scheduler_state.get("current_session", "off")
@@ -83,4 +100,14 @@ async def health() -> dict:
         "session": session_status,
         "session_message": status_messages.get(session_status, "Unknown"),
         "is_trading_active": scheduler_state.get("is_active", False),
+        "trading_enabled": trading_enabled,
+        "backfill_complete": backfill_complete,
+        "backfill_status": backfill_progress.get("status", "idle"),
+        "backfill_progress": {
+            "current": backfill_progress.get("current", 0),
+            "total": backfill_progress.get("total", 0),
+            "percentage": backfill_progress.get("percentage", 0.0),
+            "estimated_seconds_remaining": backfill_progress.get("estimated_seconds_remaining"),
+        },
+        "metrics_precision": metrics_precision,
     }

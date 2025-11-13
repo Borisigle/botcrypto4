@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time as time_module
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -56,6 +57,17 @@ class ContextService:
         self._periodic_task: Optional[asyncio.Task[None]] = None
         self._backfill_task: Optional[asyncio.Task[None]] = None
         self._exchange_info_logged = False
+
+        # Backfill tracking
+        self.backfill_complete: bool = False
+        self.backfill_progress: Dict[str, Any] = {
+            "current": 0,
+            "total": 0,
+            "percentage": 0.0,
+            "status": "idle",  # idle, in_progress, complete, error, cancelled, skipped
+            "estimated_seconds_remaining": None,
+        }
+        self._backfill_started_at: Optional[float] = None
 
         self.exchange_info: Optional[SymbolExchangeInfo] = exchange_info
         self.tick_size: Optional[float] = exchange_info.tick_size if exchange_info else None
@@ -125,11 +137,19 @@ class ContextService:
         data_source_lower = self.settings.data_source.lower()
         if data_source_lower == "hft_connector":
             logger.info("Backfill: skipped (using %s for live data)", data_source_lower)
+            # Mark backfill as complete/skipped immediately for hft_connector
+            self.backfill_complete = True
+            self.backfill_progress["status"] = "skipped"
         elif self.settings.context_backfill_enabled:
             # Run backfill in background to avoid blocking startup
             logger.info("Starting backfill in background (non-blocking startup)...")
             self._backfill_task = asyncio.create_task(self._run_backfill_background(now, today))
         else:
+            # Backfill disabled via configuration
+            self.backfill_complete = True
+            self.backfill_progress["status"] = "disabled"
+            self.backfill_progress["percentage"] = 100.0
+            
             # If backfill is disabled, try to load previous day synchronously
             if self.settings.context_bootstrap_prev_day:
                 prev_day = today - timedelta(days=1)
@@ -318,20 +338,31 @@ class ContextService:
 
     def get_backfill_status(self) -> Dict[str, Any]:
         """Get the current status of background backfill."""
-        if self._backfill_task is None:
-            return {"status": "not_started", "running": False}
+        # Return progress info with enhanced status
+        result = {
+            "status": self.backfill_progress.get("status", "idle"),
+            "running": self.backfill_progress.get("status") == "in_progress",
+            "complete": self.backfill_complete,
+            "progress": {
+                "current": self.backfill_progress.get("current", 0),
+                "total": self.backfill_progress.get("total", 0),
+                "percentage": self.backfill_progress.get("percentage", 0.0),
+                "estimated_seconds_remaining": self.backfill_progress.get("estimated_seconds_remaining"),
+            },
+        }
         
-        if self._backfill_task.done():
-            # Check if it completed successfully or with an error
-            try:
-                self._backfill_task.result()
-                return {"status": "completed", "running": False}
-            except asyncio.CancelledError:
-                return {"status": "cancelled", "running": False}
-            except Exception as exc:
-                return {"status": "failed", "running": False, "error": str(exc)}
-        else:
-            return {"status": "running", "running": True}
+        # Add task status if available
+        if self._backfill_task is not None:
+            if self._backfill_task.done():
+                try:
+                    self._backfill_task.result()
+                except asyncio.CancelledError:
+                    result["status"] = "cancelled"
+                except Exception as exc:
+                    result["status"] = "error"
+                    result["error"] = str(exc)
+        
+        return result
 
     async def wait_for_backfill(self, timeout: Optional[float] = None) -> bool:
         """Wait for background backfill to complete. Returns True if successful, False otherwise."""
@@ -352,6 +383,55 @@ class ContextService:
         except Exception:
             # Background task handles its own exceptions
             return False
+
+    def _reset_backfill_state(self) -> None:
+        """Reset backfill tracking to initial state."""
+        self.backfill_complete = False
+        self.backfill_progress.update(
+            {
+                "current": 0,
+                "total": 0,
+                "percentage": 0.0,
+                "status": "idle",
+                "estimated_seconds_remaining": None,
+            }
+        )
+        self._backfill_started_at = None
+
+    def _mark_backfill_complete(self) -> None:
+        """Mark backfill as complete and enable trading."""
+        self.backfill_complete = True
+        self.backfill_progress["status"] = "complete"
+        self.backfill_progress["current"] = self.backfill_progress.get("total", self.backfill_progress.get("current", 0))
+        self.backfill_progress["percentage"] = 100.0
+        self.backfill_progress["estimated_seconds_remaining"] = 0
+        logger.info("✅ Backfill complete! TRADING NOW ENABLED")
+        logger.info("📊 Metrics are now PRECISE and ready for trading")
+
+    def _update_backfill_progress(self, current: int, total: int, start_time: Optional[float] = None) -> None:
+        """Update backfill progress tracking."""
+        self.backfill_progress["current"] = current
+        self.backfill_progress["total"] = total
+        self.backfill_progress["percentage"] = (current / total * 100.0) if total > 0 else 0.0
+        
+        # Estimate remaining time if we have a start time
+        if start_time and current > 0:
+            elapsed = time_module.time() - start_time
+            rate = current / elapsed
+            remaining_items = total - current
+            estimated_seconds = remaining_items / rate if rate > 0 else None
+            self.backfill_progress["estimated_seconds_remaining"] = int(estimated_seconds) if estimated_seconds else None
+        
+        # Log progress at intervals
+        if total > 0 and current % max(1, total // 10) == 0:
+            vwap = self._current_vwap("base")
+            logger.info(
+                "Backfill progress: %d/%d chunks (%.1f%%), VWAP=%s (partial)",
+                current,
+                total,
+                self.backfill_progress["percentage"],
+                self._format_float(vwap),
+            )
 
     def _session_state(self, now: datetime) -> Dict[str, Any]:
         current_time = now.timetz()
@@ -473,7 +553,10 @@ class ContextService:
     async def _run_backfill_background(self, now: datetime, today: date) -> None:
         """Run backfill in background without blocking startup."""
         try:
+            self.backfill_progress["status"] = "in_progress"
             logger.info("Background backfill: started")
+            logger.info("⚠️  TRADING DISABLED - Backfill in progress")
+            
             prev_levels_loaded = await self._perform_backfill(now)
             
             # If backfill didn't load previous day levels, try loading from cache
@@ -484,11 +567,15 @@ class ContextService:
                     self.prev_day_levels.update(levels)
                     logger.info("Background backfill: loaded previous day from cache")
             
+            # Mark backfill as complete
+            self._mark_backfill_complete()
             logger.info("Background backfill: complete")
         except asyncio.CancelledError:
+            self.backfill_progress["status"] = "cancelled"
             logger.info("Background backfill: cancelled during shutdown")
             raise
         except Exception as exc:
+            self.backfill_progress["status"] = "error"
             logger.exception(
                 "Background backfill: failed",
                 extra={"error": str(exc)},
@@ -535,9 +622,13 @@ class ContextService:
             start_dt = day_start  # 00:00 UTC today
             end_dt = now  # Current UTC time
             
-            # Calculate chunk count for logging
+            # Calculate chunk count for logging and progress tracking
             duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
             chunk_count = max(1, (duration_minutes + 9) // 10)  # Round up to nearest 10min chunk
+            
+            # Initialize progress tracking
+            self.backfill_progress["total"] = chunk_count
+            self.backfill_progress["current"] = 0
             
             start_iso = start_dt.isoformat()
             end_iso = end_dt.isoformat()
@@ -637,14 +728,39 @@ class ContextService:
     ) -> int:
         trade_count = 0
         progress_step = 10000  # Log every 10,000 trades instead of 50,000
+        start_time = time_module.time()
+        
+        total_chunks = max(1, self.backfill_progress.get("total", 1))
+        chunk_duration = (end - start).total_seconds() / total_chunks if total_chunks > 0 else None
+        last_reported_chunk = self.backfill_progress.get("current", 0)
+        
         async for trade in provider.iterate_trades(start, end):
             self.ingest_trade(trade)
             trade_count += 1
+            
+            if chunk_duration and chunk_duration > 0:
+                trade_time_seconds = max(0.0, (trade.ts - start).total_seconds())
+                estimated_chunk = min(total_chunks, int(trade_time_seconds // chunk_duration))
+                if estimated_chunk > last_reported_chunk:
+                    last_reported_chunk = estimated_chunk
+                    self._update_backfill_progress(
+                        estimated_chunk,
+                        total_chunks,
+                        start_time,
+                    )
+            
             if trade_count % progress_step == 0:
                 logger.info(
                     "Backfill progress: %d trades loaded",
                     trade_count,
                 )
+        
+        # Mark as 100% complete
+        self._update_backfill_progress(
+            total_chunks,
+            total_chunks,
+            start_time,
+        )
         return trade_count
 
     async def _populate_previous_day(

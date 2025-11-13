@@ -185,10 +185,22 @@ class StrategyEngine:
         else:
             return timedelta(minutes=1)
 
+    def _can_trade(self) -> bool:
+        """Check if trading is allowed (backfill complete AND active session)."""
+        # Check if backfill is complete
+        if not self.context_service.backfill_complete:
+            return False
+        
+        # Check if we're in an active trading session
+        if not self.scheduler.is_active_session():
+            return False
+        
+        return True
+
     def ingest_trade(self, trade: TradeTick) -> None:
         """Ingest a trade tick into the strategy engine."""
-        # Only process if we're in an active session
-        if not self.scheduler.is_active_session():
+        # Only process if trading is allowed (backfill complete + active session)
+        if not self._can_trade():
             return
 
         for timeframe in self._active_timeframes:

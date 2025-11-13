@@ -1,6 +1,21 @@
+export type BackfillProgress = {
+  current: number;
+  total: number;
+  percentage: number;
+  estimated_seconds_remaining: number | null;
+};
+
 export type HealthResult = {
   status: string;
   message?: string;
+  session?: string;
+  session_message?: string;
+  is_trading_active?: boolean;
+  trading_enabled?: boolean;
+  backfill_complete?: boolean;
+  backfill_status?: string;
+  backfill_progress?: BackfillProgress;
+  metrics_precision?: string;
 };
 
 export type StreamHealth = {
@@ -73,6 +88,7 @@ export type MetricsPayload = {
   sell_volume: NullableNumber;
   footprint: FootprintEntry[];
   trade_count: number;
+  warning?: string;
 };
 
 export type MetricsResponse = {
@@ -82,6 +98,8 @@ export type MetricsResponse = {
     trade_count: number;
     buffer_size: number;
   };
+  backfill_complete?: boolean;
+  metrics_precision?: string;
 };
 
 export type StreamHealthDetail = {

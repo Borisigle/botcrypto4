@@ -71,6 +71,41 @@ async def get_metrics():
     - sell_volume: Total sell volume
     - footprint: Top 20 price bins by volume
     - trade_count: Number of trades processed
+    - backfill_complete: Whether backfill is complete
+    - metrics_precision: PRECISE or IMPRECISE with percentage
     """
+    from app.context.service import get_context_service
+    
     analyzer = get_orderflow_analyzer()
-    return analyzer.get_metrics_with_metadata()
+    metrics_data = analyzer.get_metrics_with_metadata()
+    
+    # Add backfill status information
+    context_service = get_context_service()
+    backfill_complete = context_service.backfill_complete
+    backfill_progress = context_service.backfill_progress
+    
+    # Determine metrics precision
+    if not backfill_complete:
+        status = backfill_progress.get("status", "idle")
+        percentage = backfill_progress.get("percentage", 0.0)
+        current = backfill_progress.get("current", 0)
+        total = backfill_progress.get("total", 0)
+        
+        if status == "in_progress":
+            metrics_precision = f"IMPRECISE (backfill {percentage:.0f}%)"
+            warning = f"Metrics based on partial data ({current}/{total} chunks loaded)"
+        else:
+            metrics_precision = "IMPRECISE (backfill pending)"
+            warning = "Backfill not yet started"
+    else:
+        metrics_precision = "PRECISE"
+        warning = None
+    
+    # Add backfill information to response
+    metrics_data["backfill_complete"] = backfill_complete
+    metrics_data["metrics_precision"] = metrics_precision
+    if warning:
+        if metrics_data.get("metrics"):
+            metrics_data["metrics"]["warning"] = warning
+    
+    return metrics_data
