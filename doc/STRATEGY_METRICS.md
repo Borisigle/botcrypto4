@@ -14,13 +14,13 @@ The MetricsCalculator module provides high-performance vectorized calculation of
    - Fallback mechanisms for robustness
 
 2. **OrderFlowAnalyzer** (`backend/app/strategy/analyzers/orderflow.py`)
-   - Aggregates trades over configurable intervals
-   - Manages metrics calculation and caching
-   - Provides metrics via `/strategy/metrics` endpoint
+   - Maintains incremental VWAP/POC/delta state using cumulative sums
+   - Recalculates metrics every N trades (configurable interval)
+   - Provides metrics via `/strategy/metrics` endpoint with metadata (last update, trade count, cumulative volume)
 
 3. **API Endpoint** (`/strategy/metrics`)
    - Returns latest calculated metrics
-   - Includes metadata (last update, trade count)
+   - Includes metadata (last update, trade count, cumulative volume)
 
 ## Metrics Formulas
 
@@ -123,11 +123,11 @@ analyzer.ingest_trade(trade_tick)
 ```
 WebSocket Trade
     ↓
-OrderFlowAnalyzer.ingest_trade()
-    ↓ (every 50 trades by default)
-MetricsCalculator.calculate()
+OrderFlowAnalyzer.ingest_trade()  # updates cumulative state on every trade
+    ↓ (every N trades by default)
+Incremental metrics update (VWAP / POC / Delta / Footprint)
     ↓
-_latest_metrics stored
+_latest_metrics cached
     ↓
 /strategy/metrics endpoint
 ```
@@ -161,7 +161,7 @@ curl http://localhost:8000/strategy/metrics
   "metadata": {
     "last_update": "2024-01-01T09:30:45.123456Z",
     "trade_count": 5000,
-    "buffer_size": 5000
+    "cumulative_volume": 5000
   }
 }
 ```
@@ -338,8 +338,8 @@ metrics = calc.calculate(trades)
 
 ### Issue: Performance degradation
 
-**Cause**: Too many trades in buffer without reset
-**Fix**: Call `analyzer.reset_buffer()` at day boundary
+**Cause**: Cumulative state carried across sessions without reset
+**Fix**: Call `analyzer.reset_state()` at day boundary (ContextService does this automatically)
 
 ### Issue: Missing metrics in response
 

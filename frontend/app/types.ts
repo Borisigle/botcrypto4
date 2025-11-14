@@ -97,7 +97,7 @@ export type MetricsResponse = {
   metadata: {
     last_update: NullableString;
     trade_count: number;
-    buffer_size: number;
+    cumulative_volume: number;
   };
   backfill_complete?: boolean;
   metrics_precision?: string;

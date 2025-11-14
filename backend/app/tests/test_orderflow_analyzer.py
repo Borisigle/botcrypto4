@@ -3,11 +3,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
-
 from app.strategy.analyzers.orderflow import OrderFlowAnalyzer, get_orderflow_analyzer
 from app.strategy.metrics import MetricsCalculator
-from app.ws.models import Settings, TradeSide, TradeTick
+from app.ws.models import TradeSide, TradeTick
 
 
 def _make_trade(
@@ -35,7 +33,9 @@ class TestOrderFlowAnalyzer:
         """Test OrderFlowAnalyzer initialization."""
         analyzer = OrderFlowAnalyzer()
         assert analyzer.calculation_interval == 50
-        assert analyzer._trades_buffer == []
+        assert analyzer._sum_price_qty == 0.0
+        assert analyzer._sum_qty == 0.0
+        assert analyzer._trade_count == 0
         assert analyzer._latest_metrics is None
 
     def test_ingest_single_trade(self):
@@ -50,8 +50,9 @@ class TestOrderFlowAnalyzer:
         )
         analyzer.ingest_trade(trade)
 
-        assert len(analyzer._trades_buffer) == 1
         assert analyzer._trade_count == 1
+        assert analyzer._sum_price_qty == 100.0
+        assert analyzer._sum_qty == 1.0
         assert analyzer._latest_metrics is None  # Not calculated yet
 
     def test_metrics_calculation_interval(self):
@@ -92,7 +93,7 @@ class TestOrderFlowAnalyzer:
     def test_get_latest_metrics(self):
         """Test retrieving latest metrics."""
         analyzer = OrderFlowAnalyzer(calculation_interval=2)
-        
+
         # No metrics initially
         assert analyzer.get_latest_metrics() is None
 
@@ -125,10 +126,10 @@ class TestOrderFlowAnalyzer:
         assert result["metrics"]["trade_count"] == 2
         assert result["metadata"]["last_update"] is not None
         assert result["metadata"]["trade_count"] == 2
-        assert result["metadata"]["buffer_size"] == 2
+        assert result["metadata"]["cumulative_volume"] == 3.0  # 1.0 + 2.0
 
-    def test_reset_buffer(self):
-        """Test buffer reset functionality."""
+    def test_reset_state(self):
+        """Test state reset functionality."""
         analyzer = OrderFlowAnalyzer(calculation_interval=2)
 
         trade1 = _make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1)
@@ -137,16 +138,16 @@ class TestOrderFlowAnalyzer:
         analyzer.ingest_trade(trade1)
         analyzer.ingest_trade(trade2)
 
-        assert len(analyzer._trades_buffer) == 2
         assert analyzer._trade_count == 2
+        assert analyzer._sum_qty == 3.0
 
-        # Reset buffer
-        analyzer.reset_buffer()
+        # Reset state
+        analyzer.reset_state()
 
-        assert len(analyzer._trades_buffer) == 0
         assert analyzer._trade_count == 0
-        # But metrics should still be available
-        assert analyzer._latest_metrics is not None
+        assert analyzer._sum_qty == 0.0
+        assert analyzer._sum_price_qty == 0.0
+        assert analyzer._latest_metrics is None
 
     def test_custom_metrics_calculator(self):
         """Test with custom MetricsCalculator."""
@@ -213,7 +214,7 @@ class TestOrderFlowAnalyzer:
     def test_rapid_succession_trades(self):
         """Test handling rapid succession of trades."""
         analyzer = OrderFlowAnalyzer(calculation_interval=10)
-        
+
         # Add 20 trades rapidly
         for i in range(20):
             trade = _make_trade(
@@ -229,7 +230,7 @@ class TestOrderFlowAnalyzer:
         metrics = analyzer.get_latest_metrics()
         assert metrics is not None
         assert metrics["trade_count"] == 20
-        assert len(analyzer._trades_buffer) == 20
+        assert analyzer._sum_qty == 20.0  # 20 trades x 1.0 qty each
 
     def test_metadata_timestamp_format(self):
         """Test metadata returns proper ISO format timestamp."""
@@ -244,3 +245,97 @@ class TestOrderFlowAnalyzer:
         assert isinstance(last_update, str)
         assert "T" in last_update
         assert "Z" in last_update or "+" in last_update
+
+    def test_initialize_from_backfill(self):
+        """Test initializing analyzer from backfill trades."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=50)
+
+        backfill_trades = [
+            _make_trade(
+                datetime.now(timezone.utc),
+                50000.0 + i * 10,
+                1.0,
+                TradeSide.BUY if i % 2 == 0 else TradeSide.SELL,
+                i,
+            )
+            for i in range(100)
+        ]
+
+        analyzer.initialize_from_backfill(backfill_trades)
+
+        assert analyzer._trade_count == 100
+        assert analyzer._sum_qty == 100.0
+        assert analyzer._sum_price_qty > 0
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        assert metrics["trade_count"] == 100
+        assert metrics["vwap"] is not None
+        assert metrics["poc"] is not None
+
+    def test_initialize_from_state(self):
+        """Test initializing analyzer from pre-calculated state."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=50)
+
+        analyzer.initialize_from_state(
+            sum_price_qty=5_000_000.0,
+            sum_qty=100.0,
+            volume_by_price={50000.0: 50.0, 50010.0: 50.0},
+            buy_volume=50.0,
+            sell_volume=50.0,
+            trade_count=100,
+        )
+
+        assert analyzer._trade_count == 100
+        assert analyzer._sum_qty == 100.0
+        assert analyzer._sum_price_qty == 5_000_000.0
+        assert analyzer._buy_volume == 50.0
+        assert analyzer._sell_volume == 50.0
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        assert metrics["vwap"] == 50000.0
+        assert metrics["trade_count"] == 100
+
+    def test_incremental_vwap_calculation(self):
+        """Test that VWAP updates correctly with new trades."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=2)
+
+        trade1 = _make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1)
+        analyzer.ingest_trade(trade1)
+
+        trade2 = _make_trade(datetime.now(timezone.utc), 200.0, 1.0, TradeSide.BUY, 2)
+        analyzer.ingest_trade(trade2)
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        assert metrics["vwap"] == 150.0  # (100*1 + 200*1) / (1+1)
+
+        trade3 = _make_trade(datetime.now(timezone.utc), 300.0, 2.0, TradeSide.BUY, 3)
+        analyzer.ingest_trade(trade3)
+        analyzer._update_metrics()
+
+        metrics = analyzer.get_latest_metrics()
+        assert metrics is not None
+        assert metrics["vwap"] == 225.0  # (100*1 + 200*1 + 300*2) / (1+1+2)
+
+    def test_reset_buffer_alias(self):
+        """Ensure reset_buffer remains available for backwards compatibility."""
+        analyzer = OrderFlowAnalyzer(calculation_interval=1)
+        analyzer.ingest_trade(_make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1))
+        analyzer.reset_buffer()
+        assert analyzer._trade_count == 0
+        assert analyzer._latest_metrics is None
+
+
+class TestOrderFlowAnalyzerSingleton:
+    def test_singleton_returns_same_instance(self):
+        analyzer1 = get_orderflow_analyzer()
+        analyzer2 = get_orderflow_analyzer()
+        assert analyzer1 is analyzer2
+
+    def test_singleton_preserves_state(self):
+        analyzer = get_orderflow_analyzer()
+        analyzer.reset_state()
+        analyzer.ingest_trade(_make_trade(datetime.now(timezone.utc), 100.0, 1.0, TradeSide.BUY, 1))
+        assert analyzer._trade_count == 1
