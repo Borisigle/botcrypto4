@@ -16,6 +16,7 @@ from .models import MetricsSnapshot, StreamHealth, get_settings
 from .trades import TradeStream
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class WSModule:
@@ -79,12 +80,38 @@ class WSModule:
         from app.data_sources.hft_connector import StubbedConnector
         from app.data_sources.bybit_connector import BybitConnector
 
-        # Select connector based on configuration
-        if self.settings.data_source.lower() == "bybit_connector":
-            connector_impl = BybitConnector(self.settings)
-        else:
-            # Default to stubbed connector for testing
+        data_source_lower = self.settings.data_source.lower()
+        connector_name_lower = (self.settings.connector_name or "").lower()
+        stub_keywords = ("stub", "fake", "demo", "sim")
+
+        if "bybit" in connector_name_lower or data_source_lower == "bybit_connector":
+            try:
+                connector_impl = BybitConnector(self.settings)
+            except Exception:
+                logger.exception(
+                    "Failed to initialize BybitConnector (data_source=%s, connector_name=%s)",
+                    data_source_lower,
+                    connector_name_lower or "<unset>",
+                )
+                raise
+            connector_label = "bybit"
+        elif not connector_name_lower or any(keyword in connector_name_lower for keyword in stub_keywords):
             connector_impl = StubbedConnector(self.settings)
+            connector_label = "stubbed"
+        else:
+            logger.warning(
+                "Unknown connector_name '%s', defaulting to StubbedConnector",
+                self.settings.connector_name,
+            )
+            connector_impl = StubbedConnector(self.settings)
+            connector_label = "stubbed"
+
+        logger.info(
+            "Connector mode initialized with %s connector (data_source=%s, connector_name=%s)",
+            connector_label,
+            data_source_lower,
+            connector_name_lower or "<unset>",
+        )
 
         self._connector_stream = HFTConnectorStream(
             self.settings,
