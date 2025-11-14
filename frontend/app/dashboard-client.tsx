@@ -64,10 +64,8 @@ type HealthSummary = {
   details: string[];
 };
 
-const DEFAULT_SESSION: SessionState = {
-  state: 'off',
-  nowUtc: new Date().toISOString(),
-};
+const DEFAULT_SESSION_STATE: SessionState['state'] = 'off';
+
 
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -408,7 +406,7 @@ function MetricsPanel({ metrics }: { metrics: MetricsResponse | null }) {
     <div className="panel metrics-card">
       <div className="panel__header">
         <h2>Live Metrics</h2>
-        {lastUpdate && <span className="panel__meta">Updated: {formatIsoTime(lastUpdate)}</span>}
+        {lastUpdate && <span className="panel__meta" suppressHydrationWarning>Updated: {formatIsoTime(lastUpdate)}</span>}
       </div>
       {metricsData ? (
         <div className="metrics-grid">
@@ -457,10 +455,11 @@ function MetricsPanel({ metrics }: { metrics: MetricsResponse | null }) {
 }
 
 function SessionPanel({ context }: { context: ContextResponse | null }) {
-  const session = context?.session ?? DEFAULT_SESSION;
+  const sessionState = context?.session?.state ?? DEFAULT_SESSION_STATE;
+  const sessionTime = context?.session?.nowUtc ?? null;
 
   const getSessionColor = () => {
-    switch (session.state) {
+    switch (sessionState) {
       case 'london':
         return 'session-panel--london';
       case 'overlap':
@@ -478,11 +477,13 @@ function SessionPanel({ context }: { context: ContextResponse | null }) {
       <div className="session-info">
         <div className="session-info__item">
           <span className="session-info__label">Current Session</span>
-          <span className="session-info__value">{SESSION_LABELS[session.state]}</span>
+          <span className="session-info__value">{SESSION_LABELS[sessionState]}</span>
         </div>
         <div className="session-info__item">
           <span className="session-info__label">Time (UTC)</span>
-          <span className="session-info__value">{formatIsoTime(session.nowUtc)}</span>
+          <span className="session-info__value" suppressHydrationWarning>
+            {sessionTime ? formatIsoTime(sessionTime) : '—'}
+          </span>
         </div>
       </div>
     </div>
@@ -604,7 +605,9 @@ function ConnectorHealthPanel({ wsHealth }: { wsHealth: WsHealthExtended | null 
           {wsHealth?.connector?.last_ts && (
             <div className="health-item">
               <span className="health-label">Last Update</span>
-              <span className="health-value">{formatIsoTime(wsHealth.connector.last_ts)}</span>
+              <span className="health-value" suppressHydrationWarning>
+                {formatIsoTime(wsHealth.connector.last_ts)}
+              </span>
             </div>
           )}
         </div>
@@ -633,7 +636,9 @@ function ConnectorHealthPanel({ wsHealth }: { wsHealth: WsHealthExtended | null 
           {wsHealth?.trades?.last_ts && (
             <div className="health-item">
               <span className="health-label">Last Trade</span>
-              <span className="health-value">{formatIsoTime(wsHealth.trades.last_ts)}</span>
+              <span className="health-value" suppressHydrationWarning>
+                {formatIsoTime(wsHealth.trades.last_ts)}
+              </span>
             </div>
           )}
         </div>
@@ -700,17 +705,27 @@ export default function DashboardClient({
   });
   const [metrics, setMetrics] = useState<MetricsResponse | null>(initialMetrics);
 
-  const session = context?.session ?? DEFAULT_SESSION;
-  const [utcClock, setUtcClock] = useState<Date>(() => safeDate(session.nowUtc) ?? new Date());
+  const sessionState = context?.session?.state ?? DEFAULT_SESSION_STATE;
+  const sessionNowUtc = context?.session?.nowUtc ?? null;
+  const [utcClock, setUtcClock] = useState<Date | null>(null);
+  const [isMounted, setIsMounted] = useState(false);
 
   useEffect(() => {
-    const parsed = safeDate(session.nowUtc);
-    if (parsed) {
-      setUtcClock(parsed);
+    setIsMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!isMounted) {
+      return;
     }
-  }, [session.nowUtc]);
+    const parsed = safeDate(sessionNowUtc);
+    setUtcClock(parsed ?? new Date());
+  }, [isMounted, sessionNowUtc]);
 
   useEffect(() => {
+    if (!isMounted) {
+      return;
+    }
     const timer = window.setInterval(() => {
       setUtcClock((prev) => {
         if (!prev || Number.isNaN(prev.getTime())) {
@@ -720,7 +735,7 @@ export default function DashboardClient({
       });
     }, 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [isMounted]);
 
   // Fetch context
   useEffect(() => {
@@ -952,8 +967,10 @@ export default function DashboardClient({
           </p>
         </div>
         <div className="session-status">
-          <span className={SESSION_BADGE_CLASS[session.state]}>{SESSION_LABELS[session.state]}</span>
-          <span className="session-clock">{formatUtcClock(utcClock)}</span>
+          <span className={SESSION_BADGE_CLASS[sessionState]}>{SESSION_LABELS[sessionState]}</span>
+          <span className="session-clock" suppressHydrationWarning>
+            {isMounted ? formatUtcClock(utcClock) : '—'}
+          </span>
         </div>
       </header>
 
@@ -983,7 +1000,7 @@ export default function DashboardClient({
           <div className="chart-card__header">
             <div>
               <h2>BTC Price Context</h2>
-              <p className="price-meta">Last update: {lastUpdateLabel}</p>
+              <p className="price-meta" suppressHydrationWarning>Last update: {lastUpdateLabel}</p>
             </div>
             <div className="price-value">{formatPrice(latestPrice)}</div>
           </div>
@@ -1007,7 +1024,7 @@ export default function DashboardClient({
                 ))}
               </div>
               <div className="levels-meta">
-                <span>
+                <span suppressHydrationWarning>
                   Opening range window:{' '}
                   {levels.OR
                     ? `${formatIsoTime(levels.OR.startTs)} → ${formatIsoTime(levels.OR.endTs)}`
