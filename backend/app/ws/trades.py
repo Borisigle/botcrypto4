@@ -80,6 +80,14 @@ class TradeStream(BaseStreamService):
         if self._strategy_engine:
             self._strategy_engine.ingest_trade(tick)
         
+        # Forward to orderflow analyzer
+        from app.strategy.analyzers.orderflow import get_orderflow_analyzer
+        try:
+            analyzer = get_orderflow_analyzer()
+            analyzer.ingest_trade(tick)
+        except Exception:
+            pass  # Don't fail trade ingestion if analyzer has issues
+        
         lag_ms = (datetime.now(timezone.utc) - tick.ts).total_seconds() * 1000
         structured_log(
             self.logger,
