@@ -136,31 +136,17 @@ class ContextService:
         self._roll_day(today)
 
         data_source_lower = self.settings.data_source.lower()
-        if data_source_lower == "hft_connector":
-            logger.info("Backfill: skipped (using %s for live data)", data_source_lower)
-            # Mark backfill as complete/skipped immediately for hft_connector
-            self.backfill_complete = True
-            self.backfill_progress["status"] = "skipped"
-            self.backfill_progress["percentage"] = 100.0
-            
-            # Try to load previous day from cache even when using hft_connector
-            if self.settings.context_bootstrap_prev_day:
-                prev_day = today - timedelta(days=1)
-                levels = self._load_previous_day(prev_day)
-                if levels:
-                    self.prev_day_levels.update(levels)
-                    logger.info("Loaded previous day levels from cache: PDH=%s PDL=%s VAH=%s VAL=%s POC=%s",
-                               self._format_float(levels.get("PDH")),
-                               self._format_float(levels.get("PDL")),
-                               self._format_float(levels.get("VAHprev")),
-                               self._format_float(levels.get("VALprev")),
-                               self._format_float(levels.get("POCprev")))
-        elif self.settings.context_backfill_enabled:
-            # Run backfill in background to avoid blocking startup
-            logger.info("Starting backfill in background (non-blocking startup)...")
-            self.backfill_progress["status"] = "pending"
-            self._backfill_task = asyncio.create_task(self._run_backfill_background(now, today))
-        else:
+        connector_name_lower = (self.settings.connector_name or "").lower()
+        stub_keywords = ("stub", "fake", "demo", "sim")
+        using_stub_connector = (
+            data_source_lower == "hft_connector"
+            and (
+                not connector_name_lower
+                or any(keyword in connector_name_lower for keyword in stub_keywords)
+            )
+        )
+
+        if not self.settings.context_backfill_enabled:
             # Backfill disabled via configuration
             self.backfill_complete = True
             self.backfill_progress["status"] = "disabled"
@@ -179,6 +165,34 @@ class ContextService:
                                self._format_float(levels.get("VAHprev")),
                                self._format_float(levels.get("VALprev")),
                                self._format_float(levels.get("POCprev")))
+        elif using_stub_connector:
+            logger.info(
+                "Backfill: skipped (using %s for live data; connector=%s)",
+                data_source_lower,
+                connector_name_lower or "<default>",
+            )
+            # Mark backfill as complete/skipped immediately for stubbed hft_connector usage
+            self.backfill_complete = True
+            self.backfill_progress["status"] = "skipped"
+            self.backfill_progress["percentage"] = 100.0
+            
+            # Try to load previous day from cache even when using stubbed connector
+            if self.settings.context_bootstrap_prev_day:
+                prev_day = today - timedelta(days=1)
+                levels = self._load_previous_day(prev_day)
+                if levels:
+                    self.prev_day_levels.update(levels)
+                    logger.info("Loaded previous day levels from cache: PDH=%s PDL=%s VAH=%s VAL=%s POC=%s",
+                               self._format_float(levels.get("PDH")),
+                               self._format_float(levels.get("PDL")),
+                               self._format_float(levels.get("VAHprev")),
+                               self._format_float(levels.get("VALprev")),
+                               self._format_float(levels.get("POCprev")))
+        else:
+            # Run backfill in background to avoid blocking startup
+            logger.info("Starting backfill in background (non-blocking startup)...")
+            self.backfill_progress["status"] = "pending"
+            self._backfill_task = asyncio.create_task(self._run_backfill_background(now, today))
 
         if self._periodic_task is None:
             self._periodic_task = asyncio.create_task(self._periodic_log_loop())

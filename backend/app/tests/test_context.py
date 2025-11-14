@@ -624,6 +624,7 @@ async def test_backfill_skipped_with_hft_connector(caplog) -> None:
         context_bootstrap_prev_day=False,
         context_backfill_enabled=True,
         data_source="hft_connector",
+        connector_name="stubbed_connector",
     )
     service = ContextService(
         settings=settings,
@@ -640,6 +641,52 @@ async def test_backfill_skipped_with_hft_connector(caplog) -> None:
     # Verify skip logging
     assert any("Backfill: skipped" in record.message for record in caplog.records)
     
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_backfill_executed_with_hft_connector_bybit(caplog) -> None:
+    """Test that backfill executes when HFT connector points to a real Bybit connector."""
+    import logging
+    caplog.set_level(logging.INFO, logger="context")
+    
+    current_now = [datetime(2024, 1, 1, 9, tzinfo=timezone.utc)]
+
+    backfill_called = []
+
+    class TrackingHistoryProvider:
+        async def iterate_trades(self, start: datetime, end: datetime):
+            backfill_called.append(True)
+            yield _make_trade(
+                datetime(2024, 1, 1, 8, 30, tzinfo=timezone.utc),
+                42000,
+                1.0,
+                TradeSide.BUY,
+                1,
+            )
+
+    settings = Settings(
+        context_bootstrap_prev_day=False,
+        context_backfill_enabled=True,
+        data_source="hft_connector",
+        connector_name="bybit_hft",
+    )
+    service = ContextService(
+        settings=settings,
+        now_provider=lambda: current_now[0],
+        history_provider=TrackingHistoryProvider(),
+        fetch_exchange_info=False,
+    )
+    await service.startup()
+    
+    # Wait for background backfill to complete
+    await service.wait_for_backfill(timeout=5.0)
+
+    assert len(backfill_called) >= 1, "Backfill should run with a real HFT connector"
+    assert service.trade_count >= 1
+    assert service.last_trade_price == 42000
+    assert any("Backfill: Dynamic range" in record.message for record in caplog.records)
+
     await service.shutdown()
 
 
