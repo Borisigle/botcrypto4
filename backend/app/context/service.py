@@ -152,7 +152,10 @@ class ContextService:
             self.backfill_progress["status"] = "disabled"
             self.backfill_progress["percentage"] = 100.0
             logger.info("Backfill: disabled via configuration (CONTEXT_BACKFILL_ENABLED=false)")
-            
+
+            # Initialize orderflow analyzer with current state (empty day)
+            self._initialize_orderflow_analyzer()
+
             # If backfill is disabled, try to load previous day synchronously
             if self.settings.context_bootstrap_prev_day:
                 prev_day = today - timedelta(days=1)
@@ -175,7 +178,10 @@ class ContextService:
             self.backfill_complete = True
             self.backfill_progress["status"] = "skipped"
             self.backfill_progress["percentage"] = 100.0
-            
+
+            # Initialize orderflow analyzer with current state (empty day)
+            self._initialize_orderflow_analyzer()
+
             # Try to load previous day from cache even when using stubbed connector
             if self.settings.context_bootstrap_prev_day:
                 prev_day = today - timedelta(days=1)
@@ -436,6 +442,36 @@ class ContextService:
         )
         self._backfill_started_at = None
 
+    def _initialize_orderflow_analyzer(self) -> None:
+        """Initialize OrderFlowAnalyzer with backfilled state from ContextService."""
+        try:
+            from app.strategy.analyzers.orderflow import get_orderflow_analyzer
+
+            analyzer = get_orderflow_analyzer()
+
+            if self.tick_size is not None:
+                analyzer.tick_size = self.tick_size
+                analyzer.metrics_calculator.tick_size = self.tick_size
+
+            analyzer.initialize_from_state(
+                sum_price_qty=self.sum_price_qty_base,
+                sum_qty=self.sum_qty_base,
+                volume_by_price=dict(self.volume_by_price),
+                buy_volume=0.0,
+                sell_volume=0.0,
+                trade_count=self.trade_count,
+            )
+
+            logger.info(
+                "OrderFlowAnalyzer initialized from backfill: trades=%d, tick_size=%s, VWAP=%s, POC=%s",
+                self.trade_count,
+                self.tick_size,
+                self._format_float(self._current_vwap("base")),
+                self._format_float(self.poc_price),
+            )
+        except Exception as exc:
+            logger.warning("Failed to initialize OrderFlowAnalyzer from backfill: %s", exc)
+
     def _mark_backfill_complete(self) -> None:
         """Mark backfill as complete and enable trading."""
         self.backfill_complete = True
@@ -512,6 +548,16 @@ class ContextService:
         self.total_volume = 0.0
         self.or_high = None
         self.or_low = None
+
+        try:
+            from app.strategy.analyzers.orderflow import get_orderflow_analyzer
+
+            analyzer = get_orderflow_analyzer()
+            analyzer.reset_state()
+            logger.debug("OrderFlowAnalyzer reset for new trading day")
+        except Exception as exc:
+            logger.warning("Failed to reset OrderFlowAnalyzer on day roll: %s", exc)
+
         self.last_trade_price = None
         self.last_trade_ts = None
         self.last_trade_snapshot = None
@@ -682,6 +728,9 @@ class ContextService:
                                self._format_float(levels.get("POCprev")))
                 else:
                     logger.warning("Previous day levels not available (no cache found for %s)", prev_day.isoformat())
+
+            # Initialize orderflow analyzer with backfilled state
+            self._initialize_orderflow_analyzer()
             
             # Mark backfill as complete
             self._mark_backfill_complete()
