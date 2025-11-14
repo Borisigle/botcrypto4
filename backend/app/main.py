@@ -72,7 +72,19 @@ async def shutdown_event() -> None:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    # Include basic backfill status in health check
+    backfill_status = context_service.get_backfill_status()
+    backfill_complete = context_service.backfill_complete
+    
+    # Consider the system healthy if backfill is complete, skipped, or disabled
+    healthy_statuses = ["complete", "skipped", "disabled"]
+    is_healthy = backfill_status.get("status") in healthy_statuses or backfill_complete
+    
+    return {
+        "status": "Healthy" if is_healthy else "Degraded",
+        "backfill_status": backfill_status.get("status"),
+        "backfill_complete": backfill_complete,
+    }
 
 
 def _build_readiness_payload() -> dict:
@@ -94,15 +106,25 @@ def _build_readiness_payload() -> dict:
         metrics_precision = "PRECISE"
 
     session_status = scheduler_state.get("current_session", "off")
+    backfill_status = backfill_progress.get("status", "idle")
+
+    if backfill_status == "error":
+        readiness_status = "Error"
+    elif backfill_complete or backfill_status in {"complete", "skipped", "disabled"}:
+        readiness_status = "Healthy"
+    elif backfill_status in {"in_progress", "pending"}:
+        readiness_status = "WarmingUp"
+    else:
+        readiness_status = "Unknown"
 
     return {
-        "status": "ok",
+        "status": readiness_status,
         "session": session_status,
         "session_message": STATUS_MESSAGES.get(session_status, "Unknown"),
         "is_trading_active": scheduler_state.get("is_active", False),
         "trading_enabled": trading_enabled,
         "backfill_complete": backfill_complete,
-        "backfill_status": backfill_progress.get("status", "idle"),
+        "backfill_status": backfill_status,
         "backfill_progress": {
             "current": backfill_progress.get("current", 0),
             "total": backfill_progress.get("total", 0),

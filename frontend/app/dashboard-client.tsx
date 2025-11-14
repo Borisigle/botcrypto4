@@ -187,8 +187,11 @@ function computeHealthSummary(
   health: HealthResult | null,
   ws: WsHealthExtended | null,
 ): HealthSummary {
-  const backendStatus = health?.status?.toLowerCase() ?? 'unknown';
-  const backendOk = backendStatus === 'ok';
+  const statusLabel = health?.status ?? 'Unknown';
+  const backendStatus = statusLabel.toLowerCase();
+  const backendOk = backendStatus === 'ok' || backendStatus === 'healthy';
+  const isWarmingUp = backendStatus === 'warmingup';
+  const isError = backendStatus === 'error';
 
   // Determine which health indicators to check
   const hasConnector = ws?.connector != null;
@@ -209,7 +212,7 @@ function computeHealthSummary(
     depthConnected = ws.depth?.connected ?? false;
   }
 
-  const details: string[] = [`API: ${backendOk ? 'OK' : backendStatus === 'unknown' ? 'Unknown' : health?.status ?? 'Unavailable'}`];
+  const details: string[] = [`API: ${statusLabel}`];
 
   if (hasConnector) {
     details.push(`Connector: ${connectorConnected ? 'Connected' : 'Down'}`);
@@ -218,14 +221,15 @@ function computeHealthSummary(
     details.push(`Depth WS: ${hasDepth ? (depthConnected ? 'Connected' : 'Down') : 'Unknown'}`);
   }
 
-  let level: HealthLevel;
-
   const anyDown = connectorConnected === false || tradesConnected === false || depthConnected === false;
 
+  let level: HealthLevel;
   if (backendOk && !anyDown) {
     level = hasConnector || hasTrades || hasDepth ? 'ok' : 'unknown';
-  } else if (!backendOk && backendStatus !== 'unknown' && anyDown) {
+  } else if (isError || (backendStatus === 'degraded' && anyDown)) {
     level = 'down';
+  } else if (isWarmingUp && !anyDown) {
+    level = 'degraded';
   } else if (!backendOk || anyDown) {
     level = 'degraded';
   } else {
@@ -880,6 +884,15 @@ export default function DashboardClient({
     }
 
     const prevColor = '#cbd5f5';
+    if (isNumber(levels.VWAPprev)) {
+      lines.push({
+        id: 'VWAPprev',
+        label: 'Prev VWAP',
+        value: levels.VWAPprev as number,
+        color: prevColor,
+        dashed: true,
+      });
+    }
     if (isNumber(levels.PDH)) {
       lines.push({
         id: 'PDH',
