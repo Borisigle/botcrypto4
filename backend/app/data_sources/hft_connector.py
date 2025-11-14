@@ -89,8 +89,7 @@ class HFTConnectorStream(BaseStreamService):
 
     async def on_start(self) -> None:
         """Connect to the HFT connector."""
-        await self._connect_with_retry()
-        self._handle_connected()
+        await self._attempt_connect(initial=True)
 
     async def on_stop(self) -> None:
         """Disconnect from the HFT connector."""
@@ -104,14 +103,20 @@ class HFTConnectorStream(BaseStreamService):
                 connector="hft",
             )
 
-    async def _connect_with_retry(self) -> None:
+    async def _connect_with_retry(self) -> bool:
         """Connect to the connector with exponential backoff."""
-        self._reconnection_attempts = 0
+        attempts = 0
         backoff = 0.5
+        raw_max_attempts = self._max_reconnection_attempts
+        max_attempts = raw_max_attempts if raw_max_attempts is not None else 0
+        unlimited = max_attempts <= 0
+        last_error: Optional[Exception] = None
+
+        self._reconnection_attempts = 0
 
         while (
             not self._stop_event.is_set()
-            and self._reconnection_attempts < self._max_reconnection_attempts
+            and (unlimited or attempts < max_attempts)
         ):
             try:
                 await self.connector.connect()
@@ -126,57 +131,132 @@ class HFTConnectorStream(BaseStreamService):
                     connector="hft",
                 )
                 self.logger.info("Connector stream started, receiving live data")
-                return
+                return True
             except Exception as exc:
-                self._reconnection_attempts += 1
+                attempts += 1
+                last_error = exc
+                self._reconnection_attempts = attempts
                 structured_log(
                     self.logger,
                     "connector_connection_error",
-                    attempt=self._reconnection_attempts,
-                    max_attempts=self._max_reconnection_attempts,
+                    attempt=attempts,
+                    max_attempts=None if unlimited else max_attempts,
                     error=str(exc),
                     connector="hft",
                     retry_delay=round(backoff, 2),
                 )
-                if self._reconnection_attempts < self._max_reconnection_attempts:
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 10.0)
+                if not unlimited and attempts >= max_attempts:
+                    break
+                if self._stop_event.is_set():
+                    break
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                    return False
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, 10.0)
+
+        if last_error:
+            structured_log(
+                self.logger,
+                "connector_connection_exhausted",
+                attempts=attempts,
+                max_attempts=None if unlimited else max_attempts,
+                error=str(last_error),
+                connector="hft",
+            )
+        if attempts > 0:
+            self._reconnection_backoff = min(
+                max(self._reconnection_backoff, 1.0) * 2,
+                60.0,
+            )
+        return False
+
+    async def _attempt_connect(self, *, initial: bool = False) -> bool:
+        success = await self._connect_with_retry()
+        if success:
+            self._handle_connected()
+            return True
+
+        if self._stop_event.is_set():
+            return False
+
+        raw_max_attempts = self._max_reconnection_attempts
+        max_attempts_field = (
+            None
+            if raw_max_attempts is None or raw_max_attempts <= 0
+            else raw_max_attempts
+        )
+
+        event_name = "connector_initial_connect_failed" if initial else "connector_reconnect_failed"
+        structured_log(
+            self.logger,
+            event_name,
+            connector="hft",
+            attempts=self._reconnection_attempts,
+            max_attempts=max_attempts_field,
+            cooldown=round(max(self._reconnection_backoff, 1.0), 2),
+        )
+        return False
+
+    async def _ensure_connected(self) -> bool:
+        if self._stop_event.is_set():
+            return False
+
+        try:
+            connected = await self.connector.is_connected()
+        except Exception as exc:
+            structured_log(
+                self.logger,
+                "connector_status_error",
+                error=str(exc),
+                connector="hft",
+            )
+            connected = False
+
+        if connected:
+            if not self.state.connected:
+                self._handle_connected()
+            return True
+
+        if self.state.connected:
+            structured_log(
+                self.logger,
+                "connector_disconnected",
+                connector="hft",
+            )
+            self._handle_disconnected()
+
+        return await self._attempt_connect()
+
+    async def _cooldown_after_failure(self) -> None:
+        if self._stop_event.is_set():
+            return
+        cooldown = min(max(self._reconnection_backoff, 1.0), 60.0)
+        structured_log(
+            self.logger,
+            "connector_reconnect_cooldown",
+            connector="hft",
+            cooldown=round(cooldown, 2),
+        )
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=cooldown)
+        except asyncio.TimeoutError:
+            pass
 
     async def _network_loop(self) -> None:
         """Event loop for receiving data from the connector."""
-        await self._connect_with_retry()
-
         while not self._stop_event.is_set():
-            try:
-                is_connected = await self.connector.is_connected()
-                if not is_connected:
-                    structured_log(
-                        self.logger,
-                        "connector_disconnected",
-                        connector="hft",
-                    )
-                    self._handle_disconnected()
-                    await self._connect_with_retry()
-                    if not self._stop_event.is_set():
-                        self._handle_connected()
-                    continue
+            if not await self._ensure_connected():
+                await self._cooldown_after_failure()
+                continue
 
-                # Get next event with timeout
+            try:
                 event = await asyncio.wait_for(
                     self.connector.next_event(),
                     timeout=1.0,
                 )
-
-                if event is None:
-                    continue
-
-                if self._stop_event.is_set() or self.queue is None:
-                    break
-
-                await self._enqueue(event)
-
             except asyncio.TimeoutError:
-                # No event received within timeout, continue
                 continue
             except asyncio.CancelledError:
                 raise
@@ -187,10 +267,21 @@ class HFTConnectorStream(BaseStreamService):
                     error=str(exc),
                     connector="hft",
                 )
-                self._handle_disconnected()
-                if not self._stop_event.is_set():
-                    await asyncio.sleep(2.0)
-                    await self._connect_with_retry()
+                if self.state.connected:
+                    self._handle_disconnected()
+                if self._stop_event.is_set():
+                    break
+                if not await self._attempt_connect():
+                    await self._cooldown_after_failure()
+                continue
+
+            if event is None:
+                continue
+
+            if self._stop_event.is_set() or self.queue is None:
+                break
+
+            await self._enqueue(event)
 
     async def handle_payload(self, payload: Any) -> None:
         """Process a decoded event from the connector."""

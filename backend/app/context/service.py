@@ -540,13 +540,39 @@ class ContextService:
 
     def _get_history_provider(self) -> Optional[TradeHistoryProvider]:
         if self._history_provider is None:
-            # Choose provider based on configuration
-            data_source_lower = self.settings.data_source.lower()
-            if data_source_lower in ("bybit", "bybit_connector"):
-                logger.info("Using BybitConnectorHistory for backfill")
+            data_source_lower = (self.settings.data_source or "").lower()
+            connector_name = (self.settings.connector_name or "").lower()
+            provider_hint = (self.settings.backfill_provider or "").strip().lower()
+
+            if provider_hint:
+                selection = provider_hint
+                selection_source = "backfill_provider"
+            elif "binance" in connector_name:
+                selection = "binance"
+                selection_source = "connector_name"
+            elif "bybit" in connector_name:
+                selection = "bybit"
+                selection_source = "connector_name"
+            elif "bybit" in data_source_lower:
+                selection = "bybit"
+                selection_source = "data_source"
+            else:
+                selection = "binance"
+                selection_source = "default"
+
+            if "bybit" in selection:
+                logger.info(
+                    "Using BybitConnectorHistory for backfill (source=%s, hint=%s)",
+                    selection_source,
+                    selection,
+                )
                 self._history_provider = BybitConnectorHistory(self.settings)
             else:
-                logger.info("Using BinanceTradeHistory for backfill")
+                logger.info(
+                    "Using BinanceTradeHistory for backfill (source=%s, hint=%s)",
+                    selection_source,
+                    selection,
+                )
                 self._history_provider = BinanceTradeHistory(self.settings)
         return self._history_provider
 
