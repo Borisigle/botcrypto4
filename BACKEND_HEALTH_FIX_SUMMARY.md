@@ -41,7 +41,8 @@ Modified `app/ws/depth.py` to make the snapshot refresh non-blocking:
 ✅ **Trade stream works** - receiving live trade data
 ✅ **Depth stream connects** (though snapshot fails due to HTTP 451, it doesn't block startup)
 ✅ **All endpoints responsive**:
-- /health: Returns service status, backfill progress, session info
+- /health: Instant liveness ({ "status": "ok" })
+- /ready: Returns service status, backfill progress, session info
 - /strategy/metrics: Returns metrics data
 - /ws/health: Returns WebSocket connection status
 

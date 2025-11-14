@@ -48,6 +48,13 @@ strategy_engine = get_strategy_engine()
 # Connect strategy engine to WS module for trade ingestion
 ws_module.set_strategy_engine(strategy_engine)
 
+STATUS_MESSAGES = {
+    "london": "🇬🇧 LONDON SESSION ACTIVE (08:00-12:00 UTC)",
+    "overlap": "🌍 NY OVERLAP ACTIVE (13:00-17:00 UTC)",
+    "waiting_for_session": "⏳ ESPERANDO LONDON - NO OPERAR",
+    "off": "⏳ NO SESSION",
+}
+
 
 @app.on_event("startup")
 async def startup_event() -> None:
@@ -65,19 +72,19 @@ async def shutdown_event() -> None:
 
 @app.get("/health")
 async def health() -> dict:
-    """Return basic service status including session and backfill information."""
+    return {"status": "ok"}
+
+
+def _build_readiness_payload() -> dict:
     engine = get_strategy_engine()
     scheduler_state = engine.scheduler.get_session_info()
-    
-    # Get backfill status
+
     backfill_progress = context_service.backfill_progress.copy()
     backfill_complete = context_service.backfill_complete
-    
-    # Determine if trading is enabled
+
     is_session_active = scheduler_state.get("is_active", False)
     trading_enabled = backfill_complete and is_session_active
-    
-    # Determine metrics precision
+
     if not backfill_complete:
         if backfill_progress.get("status") == "in_progress":
             metrics_precision = f"IMPRECISE (backfill {backfill_progress.get('percentage', 0):.0f}%)"
@@ -85,20 +92,13 @@ async def health() -> dict:
             metrics_precision = "IMPRECISE (backfill pending)"
     else:
         metrics_precision = "PRECISE"
-    
-    # Map session state to frontend-friendly message
+
     session_status = scheduler_state.get("current_session", "off")
-    status_messages = {
-        "london": "🇬🇧 LONDON SESSION ACTIVE (08:00-12:00 UTC)",
-        "overlap": "🌍 NY OVERLAP ACTIVE (13:00-17:00 UTC)",
-        "waiting_for_session": "⏳ ESPERANDO LONDON - NO OPERAR",
-        "off": "⏳ NO SESSION",
-    }
-    
+
     return {
         "status": "ok",
         "session": session_status,
-        "session_message": status_messages.get(session_status, "Unknown"),
+        "session_message": STATUS_MESSAGES.get(session_status, "Unknown"),
         "is_trading_active": scheduler_state.get("is_active", False),
         "trading_enabled": trading_enabled,
         "backfill_complete": backfill_complete,
@@ -111,3 +111,8 @@ async def health() -> dict:
         },
         "metrics_precision": metrics_precision,
     }
+
+
+@app.get("/ready")
+async def ready() -> dict:
+    return _build_readiness_payload()

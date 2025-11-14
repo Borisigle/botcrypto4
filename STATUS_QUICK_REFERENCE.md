@@ -83,7 +83,8 @@ docker compose up --build
 ## 🌐 Endpoints principales
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /health` | Status + session |
+| `GET /health` | Liveness (instant `{ "status": "ok" }`) |
+| `GET /ready` | Readiness (session, backfill, trading flags) |
 | `GET /context` | Metrics (VWAP, POC, etc) |
 | `GET /strategy/status` | Regime + candles |
 | `GET /ws/health` | Connector health |
@@ -129,7 +130,7 @@ docker compose logs -f backend
 curl http://localhost:8000/backfill/status
 
 # Ver session actual
-curl http://localhost:8000/health | jq .session
+curl http://localhost:8000/ready | jq .session
 
 # Metrics en vivo
 curl http://localhost:8000/context | jq .levels
