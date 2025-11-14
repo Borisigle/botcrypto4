@@ -395,7 +395,9 @@ PORT=3001 npm start
 1. Verify backend is running:
    ```bash
    curl http://localhost:8000/health
+   curl http://localhost:8000/ready
    ```
+   The `/health` endpoint should return `{"status":"ok"}` immediately. `/ready` exposes readiness details such as session state and backfill progress.
 
 2. Check `NEXT_PUBLIC_API_URL` is correct
 

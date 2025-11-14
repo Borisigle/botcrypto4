@@ -37,6 +37,7 @@ This repository provides a minimal monorepo scaffold featuring a Next.js 14 fron
 
    - Frontend: <http://localhost:3000>
    - Backend health: <http://localhost:8000/health> (returns `{ "status": "ok" }`)
+   - Backend readiness: <http://localhost:8000/ready> (session state, backfill progress, trading flags)
 
    The homepage displays the backend health in real time by calling the FastAPI `/health` endpoint.
 
@@ -115,6 +116,7 @@ The backend includes a comprehensive strategy framework for real-time trading an
 - `/strategy/status` - Current strategy engine state and market analysis
 - `/strategy/candles` - Historical candle data by timeframe
 - `/strategy/analysis/diagnostics` - Detailed market regime diagnostics
+- `/ready` - Backend readiness (session state, backfill progress, trading flags)
 - `/context` - Live market context metrics (VWAP, POC, volume profile)
 - `/ws/health` - WebSocket stream health status
 

@@ -48,11 +48,13 @@ The dashboard fetches from the following backend endpoints:
 
 | Endpoint | Interval | Purpose |
 |----------|----------|---------|
-| `GET /health` | 5s | Backend API status and session info |
+| `GET /health` | 5s | Backend API liveness check |
 | `GET /ws/health` | 5s | WebSocket stream health (trades, depth, or connector) |
 | `GET /context` | 7s | Trading context (session state, price levels, stats) |
 | `GET /price` | 1s | Current BTC price and timestamp |
 | `GET /strategy/metrics` | 2s | Live order flow metrics (VWAP, POC, volumes, footprint) |
+
+For detailed readiness information (session status, backfill progress, trading flags), use `GET /ready`. This endpoint is designed for slower readiness checks and is not polled by default.
 
 ## Setup & Installation
 

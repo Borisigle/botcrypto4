@@ -537,10 +537,18 @@ WSModule (coordinator)
 
 ```
 GET /health
+  └── {"status": "ok"} (instant liveness check)
+
+GET /ready
   ├── status: "ok"
   ├── session: "london" | "overlap" | "off"
   ├── session_message: Human-readable message
-  └── is_trading_active: bool
+  ├── is_trading_active: bool
+  ├── trading_enabled: bool
+  ├── backfill_complete: bool
+  ├── backfill_status: str
+  ├── backfill_progress: {current, total, percentage, estimated_seconds_remaining}
+  └── metrics_precision: str
 
 GET /ws/health
   └── Returns connector/trade/depth health
