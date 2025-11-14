@@ -29,7 +29,8 @@ async function fetchWithTimeout(
 export async function fetchHealthStatus(
   baseUrl: string,
 ): Promise<HealthResult | null> {
-  const url = `${baseUrl}/health`;
+  // Use /ready endpoint which includes backfill status
+  const url = `${baseUrl}/ready`;
   try {
     const response = await fetchWithTimeout(url);
     if (!response.ok) {

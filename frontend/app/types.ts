@@ -41,6 +41,7 @@ export type OpeningRange = {
 export type ContextLevels = {
   OR: OpeningRange;
   VWAP: NullableNumber;
+  VWAPprev: NullableNumber;
   PDH: NullableNumber;
   PDL: NullableNumber;
   VAHprev: NullableNumber;

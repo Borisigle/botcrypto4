@@ -84,6 +84,7 @@ class ContextService:
             "VAHprev": None,
             "VALprev": None,
             "POCprev": None,
+            "VWAPprev": None,
         }
 
         self.current_day: Optional[date] = None
@@ -140,15 +141,31 @@ class ContextService:
             # Mark backfill as complete/skipped immediately for hft_connector
             self.backfill_complete = True
             self.backfill_progress["status"] = "skipped"
+            self.backfill_progress["percentage"] = 100.0
+            
+            # Try to load previous day from cache even when using hft_connector
+            if self.settings.context_bootstrap_prev_day:
+                prev_day = today - timedelta(days=1)
+                levels = self._load_previous_day(prev_day)
+                if levels:
+                    self.prev_day_levels.update(levels)
+                    logger.info("Loaded previous day levels from cache: PDH=%s PDL=%s VAH=%s VAL=%s POC=%s",
+                               self._format_float(levels.get("PDH")),
+                               self._format_float(levels.get("PDL")),
+                               self._format_float(levels.get("VAHprev")),
+                               self._format_float(levels.get("VALprev")),
+                               self._format_float(levels.get("POCprev")))
         elif self.settings.context_backfill_enabled:
             # Run backfill in background to avoid blocking startup
             logger.info("Starting backfill in background (non-blocking startup)...")
+            self.backfill_progress["status"] = "pending"
             self._backfill_task = asyncio.create_task(self._run_backfill_background(now, today))
         else:
             # Backfill disabled via configuration
             self.backfill_complete = True
             self.backfill_progress["status"] = "disabled"
             self.backfill_progress["percentage"] = 100.0
+            logger.info("Backfill: disabled via configuration (CONTEXT_BACKFILL_ENABLED=false)")
             
             # If backfill is disabled, try to load previous day synchronously
             if self.settings.context_bootstrap_prev_day:
@@ -156,6 +173,12 @@ class ContextService:
                 levels = self._load_previous_day(prev_day)
                 if levels:
                     self.prev_day_levels.update(levels)
+                    logger.info("Loaded previous day levels from cache: PDH=%s PDL=%s VAH=%s VAL=%s POC=%s",
+                               self._format_float(levels.get("PDH")),
+                               self._format_float(levels.get("PDL")),
+                               self._format_float(levels.get("VAHprev")),
+                               self._format_float(levels.get("VALprev")),
+                               self._format_float(levels.get("POCprev")))
 
         if self._periodic_task is None:
             self._periodic_task = asyncio.create_task(self._periodic_log_loop())
@@ -278,6 +301,7 @@ class ContextService:
                 "endTs": or_end_iso,
             },
             "VWAP": vwap_value,
+            "VWAPprev": self.prev_day_levels.get("VWAPprev"),
             "PDH": self.prev_day_levels.get("PDH"),
             "PDL": self.prev_day_levels.get("PDL"),
             "VAHprev": self.prev_day_levels.get("VAHprev"),
@@ -453,6 +477,7 @@ class ContextService:
             prev_levels = self._profile_from_volume(snapshot_map, self.day_high, self.day_low)
             if prev_levels:
                 self.prev_day_levels.update(prev_levels)
+                self._persist_prev_day_profile(self.current_day, snapshot_map)
 
         self.current_day = new_day
         self.day_start = datetime.combine(new_day, time(0, tzinfo=timezone.utc))
@@ -495,20 +520,63 @@ class ContextService:
             return "quote"
         return "base"
 
+    def _persist_prev_day_profile(self, prev_day: date, volume_map: Dict[float, float]) -> None:
+        """Persist previous day volume profile for future use."""
+        try:
+            history_dir = Path(self.settings.context_history_dir).expanduser()
+            history_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{self.settings.symbol_lower}_{prev_day.isoformat()}_profile.parquet"
+            filepath = history_dir / filename
+            
+            # Create dataframe from volume map
+            data = {
+                "price": list(volume_map.keys()),
+                "volume": list(volume_map.values()),
+            }
+            df = pl.DataFrame(data)
+            df.write_parquet(filepath)
+            logger.debug(f"Persisted volume profile for {prev_day.isoformat()}: {len(volume_map)} price levels")
+        except Exception as exc:
+            logger.warning(f"Failed to persist previous day profile: {exc}")
+
     def _load_previous_day(self, prev_day: date) -> Dict[str, Optional[float]]:
         history_dir = Path(self.settings.context_history_dir).expanduser()
         history_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Try loading from profile file first
+        profile_filename = f"{self.settings.symbol_lower}_{prev_day.isoformat()}_profile.parquet"
+        profile_path = history_dir / profile_filename
+        
+        if profile_path.exists():
+            try:
+                df = pl.read_parquet(profile_path)
+                prices = df["price"].to_list()
+                volumes = df["volume"].to_list()
+                volume_map = {float(p): float(v) for p, v in zip(prices, volumes)}
+                
+                # Calculate day high/low from prices
+                day_high = max(prices) if prices else None
+                day_low = min(prices) if prices else None
+                
+                levels = self._profile_from_volume(volume_map, day_high, day_low)
+                if levels:
+                    logger.debug(f"Loaded previous day profile from {profile_filename}")
+                    return levels
+            except Exception as exc:
+                logger.warning("failed_loading_prev_day_profile", extra={"error": str(exc), "path": str(profile_path)})
+        
+        # Fallback: Try loading from trade history file
         filename = f"{self.settings.symbol_lower}_{prev_day.isoformat()}.parquet"
         candidate = history_dir / filename
         if not candidate.exists():
             if self.settings.context_fetch_missing_history:
-                logger.warning("context_prev_day_missing", extra={"path": str(candidate)})
+                logger.debug("context_prev_day_missing", extra={"path": str(candidate)})
             return {}
 
         try:
             df = pl.read_parquet(candidate)
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("failed_loading_prev_day", extra={"error": str(exc), "path": str(candidate)})
+            logger.warning("failed_loading_prev_day", extra={"error": str(exc), "path": str(candidate)})
             return {}
 
         columns = {col.lower(): col for col in df.columns}
@@ -587,11 +655,19 @@ class ContextService:
             
             # If backfill didn't load previous day levels, try loading from cache
             if not prev_levels_loaded and self.settings.context_bootstrap_prev_day:
+                logger.info("Backfill did not load previous day levels, trying cache...")
                 prev_day = today - timedelta(days=1)
                 levels = self._load_previous_day(prev_day)
                 if levels:
                     self.prev_day_levels.update(levels)
-                    logger.info("Background backfill: loaded previous day from cache")
+                    logger.info("Background backfill: loaded previous day from cache: PDH=%s PDL=%s VAH=%s VAL=%s POC=%s",
+                               self._format_float(levels.get("PDH")),
+                               self._format_float(levels.get("PDL")),
+                               self._format_float(levels.get("VAHprev")),
+                               self._format_float(levels.get("VALprev")),
+                               self._format_float(levels.get("POCprev")))
+                else:
+                    logger.warning("Previous day levels not available (no cache found for %s)", prev_day.isoformat())
             
             # Mark backfill as complete
             self._mark_backfill_complete()
@@ -858,7 +934,10 @@ class ContextService:
                     total_trades,
                 )
 
-        levels = self._profile_from_volume(dict(volume_map), day_high, day_low)
+        profile_map = dict(volume_map)
+        if profile_map:
+            self._persist_prev_day_profile(start.date(), profile_map)
+        levels = self._profile_from_volume(profile_map, day_high, day_low)
         return levels, total_trades, total_volume
 
     @staticmethod
@@ -899,12 +978,15 @@ class ContextService:
         if day_low is None:
             day_low = min(volume_map.keys())
 
+        vwap_prev = sum(price * volume for price, volume in volume_map.items()) / total_volume
+
         return {
             "PDH": day_high,
             "PDL": day_low,
             "VAHprev": vah,
             "VALprev": val,
             "POCprev": poc_price,
+            "VWAPprev": vwap_prev,
         }
 
     def _bin_price(self, price: float) -> float:
