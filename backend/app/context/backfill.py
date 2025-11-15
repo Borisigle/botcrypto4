@@ -510,7 +510,12 @@ class BybitConnectorHistory:
         
         if cached_trades_dicts:
             # Cache hit - determine if we need to download new data
-            logger.info(f"Bybit backfill cache: HIT ({len(cached_trades_dicts)} trades from {today.isoformat()})")
+            duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
+            total_chunks = max(1, (duration_minutes + 9) // 10)
+            logger.info(
+                f"Bybit backfill cache: HIT ({len(cached_trades_dicts)} trades from {today.isoformat()}, "
+                f"expected {total_chunks} chunks for full day)"
+            )
             
             # Convert dict trades back to TradeTick objects
             cached_trades = self._dicts_to_trade_ticks(cached_trades_dicts)
@@ -526,13 +531,18 @@ class BybitConnectorHistory:
             last_cached_dt = datetime.fromtimestamp(last_cached_ts_ms / 1000, tz=timezone.utc)
             
             # Calculate gap since last cache
-            gap_hours = (end_dt - last_cached_dt).total_seconds() / 3600
+            gap_seconds = (end_dt - last_cached_dt).total_seconds()
+            gap_minutes = gap_seconds / 60
             
-            if gap_hours <= 0:
-                logger.info(f"Cache is fresh (< 1h old, gap: {gap_hours:.1f}h), using as-is")
+            if gap_seconds <= 60:  # Less than 1 minute gap
+                logger.info(f"Cache is fresh (gap: {gap_seconds:.0f}s), using as-is")
                 return cached_trades
             else:
-                logger.info(f"Gap detected: {gap_hours:.1f}h since last cache. Downloading new data...")
+                gap_chunks = max(1, int((gap_minutes + 9) // 10))
+                logger.info(
+                    f"Gap detected: {gap_minutes:.1f} min (~{gap_chunks} chunks) since last cache. "
+                    f"Downloading new data..."
+                )
                 
                 # Download new data from last cached time to end_dt
                 # Add 1ms buffer to avoid re-downloading the last cached trade
@@ -569,7 +579,7 @@ class BybitConnectorHistory:
             # No cache - do full backfill
             duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
             chunk_count = max(1, (duration_minutes + 9) // 10)  # Round up to nearest 10min chunk
-            logger.info(f"Bybit backfill cache: MISS, downloading {chunk_count} chunks")
+            logger.info(f"Bybit backfill cache: MISS, downloading {chunk_count} chunks for {duration_minutes} minutes")
             all_trades = await self._backfill_parallel(start_dt, end_dt)
         
         # Save to cache (always update to include latest data)

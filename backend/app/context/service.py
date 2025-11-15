@@ -830,8 +830,38 @@ class ContextService:
                         timeout=timeout_seconds
                     )
                     trade_count = len(trades)
-                    for trade in trades:
-                        self.ingest_trade(trade)
+                    
+                    # Update progress tracking while ingesting trades
+                    total_trades = len(trades)
+                    start_time = time_module.time()
+                    chunk_duration = (
+                        (end_dt - start_dt).total_seconds() / chunk_count
+                        if chunk_count > 0
+                        else None
+                    )
+                    last_reported_chunk = self.backfill_progress.get("current", 0)
+                    
+                    if total_trades > 0:
+                        for trade in trades:
+                            self.ingest_trade(trade)
+                            
+                            if chunk_duration and chunk_duration > 0:
+                                trade_time_seconds = max(0.0, (trade.ts - start_dt).total_seconds())
+                                estimated_chunk = min(chunk_count, int(trade_time_seconds // chunk_duration) + 1)
+                                if estimated_chunk > last_reported_chunk:
+                                    last_reported_chunk = estimated_chunk
+                                    self._update_backfill_progress(
+                                        estimated_chunk,
+                                        chunk_count,
+                                        start_time,
+                                    )
+                    
+                    # Ensure we mark completion
+                    self._update_backfill_progress(
+                        chunk_count,
+                        chunk_count,
+                        start_time,
+                    )
                 else:
                     # Use traditional backfill with timeout
                     trade_count = await asyncio.wait_for(
