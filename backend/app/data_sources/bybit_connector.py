@@ -39,6 +39,7 @@ class BybitConnectorRunner:
         self.process: Optional[subprocess.Popen] = None
         self.event_queue: asyncio.Queue = asyncio.Queue()
         self._read_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
         self._health_check_count = 0
         self._error_count = 0
 
@@ -61,8 +62,9 @@ class BybitConnectorRunner:
                 bufsize=1,  # Line buffered
             )
 
-            # Start reading from subprocess
+            # Start reading from subprocess stdout and stderr
             self._read_task = asyncio.create_task(self._read_from_subprocess())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
 
             structured_log(
                 self.logger,
@@ -83,7 +85,7 @@ class BybitConnectorRunner:
             return
 
         try:
-            # Cancel the read task
+            # Cancel the read tasks
             if self._read_task:
                 self._read_task.cancel()
                 try:
@@ -91,6 +93,14 @@ class BybitConnectorRunner:
                 except asyncio.CancelledError:
                     pass
                 self._read_task = None
+
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                try:
+                    await self._stderr_task
+                except asyncio.CancelledError:
+                    pass
+                self._stderr_task = None
 
             # Send SIGTERM to process
             if self.process and self.process.poll() is None:
@@ -156,39 +166,82 @@ class BybitConnectorRunner:
 import json
 import sys
 import asyncio
+import logging
 from datetime import datetime, timezone
 from hftbacktest.live import create, run_live
+
+# Configure logging to stderr
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stderr
+)
+logger = logging.getLogger("bybit_connector_subprocess")
 
 # Configuration from parent process
 config = {json.dumps(self.connector_config)}
 
 async def main():
+    connector = None
     try:
+        logger.info(f"Starting Bybit connector with config: {{config.get('symbol')}}")
+        
         # Initialize Live connector
         connector = await create("bybit", config, paper_trading={self.settings.connector_paper_trading})
+        logger.info("Bybit connector created successfully")
         
         # Subscribe to channels
-        await connector.subscribe(config.get('subscriptions', []))
+        subscriptions = config.get('subscriptions', [])
+        logger.info(f"Subscribing to channels: {{subscriptions}}")
+        await connector.subscribe(subscriptions)
+        logger.info("Successfully subscribed to channels")
         
         print(json.dumps({{'status': 'connected', 'connector': 'bybit'}}) + "\\n", flush=True)
         
         # Event loop
+        event_count = 0
+        last_log_time = datetime.now(timezone.utc)
+        
         while True:
             try:
                 # Get next event with timeout
                 event = await asyncio.wait_for(connector.next_event(), timeout=1.0)
                 if event:
+                    event_count += 1
                     # Parse and format the event
                     formatted_event = format_event(event)
                     print(json.dumps(formatted_event) + "\\n", flush=True)
+                    
+                    # Log periodic stats every 60 seconds
+                    now = datetime.now(timezone.utc)
+                    if (now - last_log_time).total_seconds() >= 60:
+                        logger.info(f"Processed {{event_count}} events in last 60s")
+                        event_count = 0
+                        last_log_time = now
+                        
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
-                print(json.dumps({{'status': 'error', 'error': str(e)}}) + "\\n", flush=True)
-                break
+                logger.error(f"Error processing event: {{type(e).__name__}}: {{str(e)}}")
+                print(json.dumps({{'status': 'error', 'error': f"{{type(e).__name__}}: {{str(e)}}"}}) + "\\n", flush=True)
+                # Don't break, try to continue
+                await asyncio.sleep(0.1)
+                
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, shutting down")
     except Exception as e:
-        print(json.dumps({{'status': 'error', 'error': str(e)}}) + "\\n", flush=True)
+        logger.error(f"Fatal error in main loop: {{type(e).__name__}}: {{str(e)}}", exc_info=True)
+        print(json.dumps({{'status': 'error', 'error': f"{{type(e).__name__}}: {{str(e)}}"}}) + "\\n", flush=True)
         sys.exit(1)
+    finally:
+        if connector:
+            try:
+                logger.info("Cleaning up connector")
+                # Attempt graceful cleanup if connector has close method
+                if hasattr(connector, 'close'):
+                    await connector.close()
+            except Exception as e:
+                logger.error(f"Error during cleanup: {{e}}")
 
 def format_event(event):
     # Transform raw event to our format
@@ -230,6 +283,15 @@ if __name__ == '__main__':
                     # Read a line from subprocess
                     line = await loop.run_in_executor(None, self.process.stdout.readline)
                     if not line:
+                        # Empty line might indicate end of stream
+                        poll_result = self.process.poll()
+                        if poll_result is not None:
+                            structured_log(
+                                self.logger,
+                                "bybit_connector_subprocess_exited",
+                                exit_code=poll_result,
+                            )
+                            break
                         await asyncio.sleep(0.01)
                         continue
 
@@ -249,12 +311,67 @@ if __name__ == '__main__':
                         else:
                             # Regular event (trade/depth)
                             await self.event_queue.put(event)
-                    except json.JSONDecodeError:
-                        pass
+                    except json.JSONDecodeError as exc:
+                        # Log unparseable output from subprocess
+                        structured_log(
+                            self.logger,
+                            "bybit_connector_json_decode_error",
+                            line=line.strip()[:200],
+                            error=str(exc),
+                        )
                 except Exception as exc:
                     structured_log(
                         self.logger,
                         "bybit_connector_read_error",
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(0.1)
+            
+            # If we exit the loop, log it
+            if self.process:
+                poll_result = self.process.poll()
+                if poll_result is not None:
+                    structured_log(
+                        self.logger,
+                        "bybit_connector_subprocess_terminated",
+                        exit_code=poll_result,
+                    )
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            structured_log(
+                self.logger,
+                "bybit_connector_read_fatal_error",
+                error=str(exc),
+            )
+
+    async def _read_stderr(self) -> None:
+        """Read error output from the subprocess stderr."""
+        if self.process is None or self.process.stderr is None:
+            return
+
+        try:
+            loop = asyncio.get_event_loop()
+            while self.process and self.process.poll() is None:
+                try:
+                    # Read a line from stderr
+                    line = await loop.run_in_executor(None, self.process.stderr.readline)
+                    if not line:
+                        await asyncio.sleep(0.01)
+                        continue
+
+                    # Log stderr output
+                    stderr_line = line.strip()
+                    if stderr_line:
+                        structured_log(
+                            self.logger,
+                            "bybit_connector_subprocess_stderr",
+                            stderr=stderr_line[:500],  # Limit length
+                        )
+                except Exception as exc:
+                    structured_log(
+                        self.logger,
+                        "bybit_connector_stderr_read_error",
                         error=str(exc),
                     )
                     await asyncio.sleep(0.1)
@@ -263,7 +380,7 @@ if __name__ == '__main__':
         except Exception as exc:
             structured_log(
                 self.logger,
-                "bybit_connector_read_fatal_error",
+                "bybit_connector_stderr_fatal_error",
                 error=str(exc),
             )
 
@@ -298,6 +415,7 @@ class BybitConnector(ConnectorWrapper):
         self._runner: Optional[BybitConnectorRunner] = None
         self._check_connection_task: Optional[asyncio.Task] = None
         self._last_event_time: Optional[datetime] = None
+        self._stale_connection_seconds = 60  # Consider stale if no events for 60s
 
         # Build connector configuration
         self._connector_config = self._build_config()
@@ -325,8 +443,21 @@ class BybitConnector(ConnectorWrapper):
 
     async def connect(self) -> None:
         """Connect to the Bybit connector."""
-        if self._connected:
+        # If already attempting connection, don't start another
+        if self._connected and self._runner and self._runner.is_process_alive():
             return
+
+        # Clean up any existing runner first
+        if self._runner:
+            try:
+                await self._runner.stop()
+            except Exception as exc:
+                structured_log(
+                    self.logger,
+                    "bybit_connector_cleanup_error",
+                    error=str(exc),
+                )
+            self._runner = None
 
         try:
             self._runner = BybitConnectorRunner(self._connector_config, self.settings)
@@ -339,6 +470,17 @@ class BybitConnector(ConnectorWrapper):
                 raise RuntimeError("Connector process failed to start")
 
             self._connected = True
+            self._subscribed_trades = False  # Reset subscription state
+            self._subscribed_depth = False   # Reset subscription state
+            
+            # Cancel old check task if exists
+            if self._check_connection_task:
+                self._check_connection_task.cancel()
+                try:
+                    await self._check_connection_task
+                except asyncio.CancelledError:
+                    pass
+            
             self._check_connection_task = asyncio.create_task(self._check_connection_loop())
 
             structured_log(
@@ -462,16 +604,59 @@ class BybitConnector(ConnectorWrapper):
         }
 
     async def _check_connection_loop(self) -> None:
-        """Background task to monitor connection health."""
+        """Background task to monitor connection health and detect stale connections."""
         try:
+            check_count = 0
+            connection_start_time = datetime.now(timezone.utc)
+            
             while self._connected:
+                check_count += 1
+                
+                # Check if process is alive
                 if not self._runner or not self._runner.is_process_alive():
                     structured_log(
                         self.logger,
                         "bybit_connector_process_died",
+                        last_event_time=self._last_event_time.isoformat() if self._last_event_time else None,
                     )
                     self._connected = False
                     break
+                
+                # Check for stale connection (no events received for too long)
+                # Only check if we've been connected for at least 30 seconds
+                # to avoid false positives during startup
+                time_since_connection = (datetime.now(timezone.utc) - connection_start_time).total_seconds()
+                if time_since_connection > 30 and self._last_event_time:
+                    time_since_last_event = (datetime.now(timezone.utc) - self._last_event_time).total_seconds()
+                    if time_since_last_event > self._stale_connection_seconds:
+                        structured_log(
+                            self.logger,
+                            "bybit_connector_stale_connection_detected",
+                            seconds_since_last_event=round(time_since_last_event, 1),
+                            stale_threshold=self._stale_connection_seconds,
+                            last_event_time=self._last_event_time.isoformat(),
+                        )
+                        # Mark as disconnected to trigger reconnection
+                        self._connected = False
+                        break
+                
+                # Log periodic health status every 60 seconds (12 checks at 5s intervals)
+                if check_count % 12 == 0:
+                    runner_health = self._runner.get_health_status() if self._runner else {}
+                    time_since_last = None
+                    if self._last_event_time:
+                        time_since_last = round((datetime.now(timezone.utc) - self._last_event_time).total_seconds(), 1)
+                    
+                    structured_log(
+                        self.logger,
+                        "bybit_connector_health_check",
+                        process_alive=runner_health.get("process_alive", False),
+                        queue_size=runner_health.get("queue_size", 0),
+                        error_count=runner_health.get("error_count", 0),
+                        last_event_time=self._last_event_time.isoformat() if self._last_event_time else None,
+                        seconds_since_last_event=time_since_last,
+                    )
+                
                 await asyncio.sleep(5.0)
         except asyncio.CancelledError:
             pass
