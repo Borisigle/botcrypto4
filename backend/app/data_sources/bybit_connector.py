@@ -304,10 +304,16 @@ class BybitConnector(ConnectorWrapper):
 
     def _build_config(self) -> dict[str, Any]:
         """Build the connector configuration from settings."""
+        # Build subscriptions list with trade and depth channels
+        subscriptions = [
+            {"channel": "trades", "symbol": self.settings.symbol},
+            {"channel": "depth", "symbol": self.settings.symbol},
+        ]
+        
         config = {
             "exchange": "bybit",
             "symbol": self.settings.symbol,
-            "subscriptions": [],
+            "subscriptions": subscriptions,
         }
 
         # Add API credentials if available
