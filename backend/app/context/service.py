@@ -101,6 +101,10 @@ class ContextService:
         self.day_high: Optional[float] = None
         self.day_low: Optional[float] = None
         self.pre_market_delta: float = 0.0
+        self.pre_market_buy_volume: float = 0.0
+        self.pre_market_sell_volume: float = 0.0
+        self.live_buy_volume: float = 0.0
+        self.live_sell_volume: float = 0.0
         self.volume_by_price: defaultdict[float, float] = defaultdict(float)
         self.poc_price: Optional[float] = None
         self.poc_volume: float = 0.0
@@ -277,9 +281,20 @@ class ContextService:
             if self.or_low is None or price < self.or_low:
                 self.or_low = price
 
+        # Track pre-market delta and volumes (before OR start at 08:00 UTC)
         if self.or_start and trade_ts < self.or_start:
-            delta = qty if trade.side == TradeSide.BUY else -qty
-            self.pre_market_delta += delta
+            if trade.side == TradeSide.BUY:
+                self.pre_market_buy_volume += qty
+            else:
+                self.pre_market_sell_volume += qty
+            self.pre_market_delta = self.pre_market_buy_volume - self.pre_market_sell_volume
+        
+        # Track live (post-OR) buy/sell volumes
+        if self.or_start and trade_ts >= self.or_start:
+            if trade.side == TradeSide.BUY:
+                self.live_buy_volume += qty
+            else:
+                self.live_sell_volume += qty
 
         price_bin = self._bin_price(price)
         volume = self.volume_by_price[price_bin] + qty
@@ -335,9 +350,17 @@ class ContextService:
         range_today = None
         if self.day_high is not None and self.day_low is not None:
             range_today = self.day_high - self.day_low
+        
+        live_delta = self.live_buy_volume - self.live_sell_volume
+        
         return {
             "rangeToday": range_today,
             "cd_pre": self.pre_market_delta,
+            "pre_market_buy_volume": self.pre_market_buy_volume,
+            "pre_market_sell_volume": self.pre_market_sell_volume,
+            "live_buy_volume": self.live_buy_volume,
+            "live_sell_volume": self.live_sell_volume,
+            "live_delta": live_delta,
         }
 
     def debug_vwap_payload(self) -> Dict[str, Any]:
@@ -453,21 +476,27 @@ class ContextService:
                 analyzer.tick_size = self.tick_size
                 analyzer.metrics_calculator.tick_size = self.tick_size
 
+            # Calculate total buy/sell volumes from both pre-market and live
+            total_buy_volume = self.pre_market_buy_volume + self.live_buy_volume
+            total_sell_volume = self.pre_market_sell_volume + self.live_sell_volume
+
             analyzer.initialize_from_state(
                 sum_price_qty=self.sum_price_qty_base,
                 sum_qty=self.sum_qty_base,
                 volume_by_price=dict(self.volume_by_price),
-                buy_volume=0.0,
-                sell_volume=0.0,
+                buy_volume=total_buy_volume,
+                sell_volume=total_sell_volume,
                 trade_count=self.trade_count,
             )
 
             logger.info(
-                "OrderFlowAnalyzer initialized from backfill: trades=%d, tick_size=%s, VWAP=%s, POC=%s",
+                "OrderFlowAnalyzer initialized from backfill: trades=%d, tick_size=%s, VWAP=%s, POC=%s, buy_vol=%s, sell_vol=%s",
                 self.trade_count,
                 self.tick_size,
                 self._format_float(self._current_vwap("base")),
                 self._format_float(self.poc_price),
+                self._format_float(total_buy_volume),
+                self._format_float(total_sell_volume),
             )
         except Exception as exc:
             logger.warning("Failed to initialize OrderFlowAnalyzer from backfill: %s", exc)
@@ -541,6 +570,10 @@ class ContextService:
         self.day_high = None
         self.day_low = None
         self.pre_market_delta = 0.0
+        self.pre_market_buy_volume = 0.0
+        self.pre_market_sell_volume = 0.0
+        self.live_buy_volume = 0.0
+        self.live_sell_volume = 0.0
         self.volume_by_price = defaultdict(float)
         self.poc_price = None
         self.poc_volume = 0.0
@@ -1054,17 +1087,53 @@ class ContextService:
 
         poc_price, poc_volume = max(volume_map.items(), key=lambda item: (item[1], -item[0]))
 
-        sorted_by_volume = sorted(volume_map.items(), key=lambda item: (-item[1], item[0]))
-        cumulative = 0.0
-        selected_prices: set[float] = set()
-        for price, vol in sorted_by_volume:
-            selected_prices.add(price)
-            cumulative += vol
-            if cumulative >= total_volume * 0.7:
+        # Calculate Value Area (VAH/VAL) using proper methodology:
+        # Start from POC and expand outward to adjacent price levels until 70% volume is reached
+        target_volume = total_volume * 0.7
+        
+        # Get sorted list of all prices
+        sorted_prices = sorted(volume_map.keys())
+        
+        # Find POC index in sorted prices
+        poc_index = sorted_prices.index(poc_price)
+        
+        # Initialize Value Area with POC
+        value_area_prices = {poc_price}
+        cumulative_volume = volume_map[poc_price]
+        
+        # Expand outward from POC
+        lower_index = poc_index - 1
+        upper_index = poc_index + 1
+        
+        while cumulative_volume < target_volume:
+            # Determine which direction to expand
+            lower_volume = volume_map.get(sorted_prices[lower_index], 0.0) if lower_index >= 0 else 0.0
+            upper_volume = volume_map.get(sorted_prices[upper_index], 0.0) if upper_index < len(sorted_prices) else 0.0
+            
+            # If both sides exhausted, break
+            if lower_volume == 0.0 and upper_volume == 0.0:
                 break
+            
+            # Expand to the side with higher volume
+            if lower_volume >= upper_volume and lower_index >= 0:
+                value_area_prices.add(sorted_prices[lower_index])
+                cumulative_volume += lower_volume
+                lower_index -= 1
+            elif upper_index < len(sorted_prices):
+                value_area_prices.add(sorted_prices[upper_index])
+                cumulative_volume += upper_volume
+                upper_index += 1
+            else:
+                # Only one side available
+                if lower_index >= 0:
+                    value_area_prices.add(sorted_prices[lower_index])
+                    cumulative_volume += lower_volume
+                    lower_index -= 1
+                else:
+                    break
 
-        vah = max(selected_prices) if selected_prices else None
-        val = min(selected_prices) if selected_prices else None
+        vah = max(value_area_prices) if value_area_prices else None
+        val = min(value_area_prices) if value_area_prices else None
 
         if day_high is None:
             day_high = max(volume_map.keys())

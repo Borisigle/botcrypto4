@@ -318,6 +318,19 @@ class HFTConnectorStream(BaseStreamService):
         # Forward to strategy engine if available
         if self._strategy_engine:
             self._strategy_engine.ingest_trade(tick)
+        
+        # Forward to OrderFlowAnalyzer for real-time metrics
+        try:
+            from app.strategy.analyzers.orderflow import get_orderflow_analyzer
+            analyzer = get_orderflow_analyzer()
+            analyzer.ingest_trade(tick)
+        except Exception as exc:
+            structured_log(
+                self.logger,
+                "orderflow_ingest_error",
+                error=str(exc),
+                connector="hft",
+            )
 
         lag_ms = (datetime.now(timezone.utc) - tick.ts).total_seconds() * 1000
         structured_log(
