@@ -168,7 +168,21 @@ import sys
 import asyncio
 import logging
 from datetime import datetime, timezone
-from hftbacktest.live import create, run_live
+
+# Try to import hftbacktest.live, fall back to mock if not available
+try:
+    from hftbacktest.live import create, run_live
+    USE_MOCK = False
+    print(json.dumps({{'status': 'info', 'message': 'Using hftbacktest.live'}}) + "\\n", flush=True)
+except ImportError:
+    # Load the mock implementation from the temporary file
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("hftbacktest_mock_live", "/tmp/hftbacktest_mock_live.py")
+    mock_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mock_module)
+    create, run_live = mock_module.create, mock_module.run_live
+    USE_MOCK = True
+    print(json.dumps({{'status': 'info', 'message': 'Using mock hftbacktest.live'}}) + "\\n", flush=True)
 
 # Configure logging to stderr
 logging.basicConfig(
