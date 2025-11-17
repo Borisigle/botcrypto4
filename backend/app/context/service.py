@@ -68,6 +68,11 @@ class ContextService:
             "estimated_seconds_remaining": None,
         }
         self._backfill_started_at: Optional[float] = None
+        
+        # Trade source tracking
+        self.trades_from_backfill: int = 0
+        self.trades_from_live: int = 0
+        self.live_trades_rejected: int = 0
 
         self.exchange_info: Optional[SymbolExchangeInfo] = exchange_info
         self.tick_size: Optional[float] = exchange_info.tick_size if exchange_info else None
@@ -224,7 +229,7 @@ class ContextService:
                 pass
             self._backfill_task = None
 
-    def ingest_trade(self, trade: TradeTick) -> None:
+    def ingest_trade(self, trade: TradeTick, from_backfill: bool = False) -> None:
         trade_ts = trade.ts.astimezone(timezone.utc)
         trade_day = trade_ts.date()
 
@@ -234,6 +239,17 @@ class ContextService:
         if not self.day_start or trade_ts < self.day_start or trade_ts >= self.day_start + timedelta(days=1):
             # Ignore trades that do not belong to the active session window
             return
+
+        # Check if live data is disabled (only accept backfill data)
+        if not from_backfill and self.settings.context_disable_live_data:
+            self.live_trades_rejected += 1
+            return
+        
+        # Track trade source
+        if from_backfill:
+            self.trades_from_backfill += 1
+        else:
+            self.trades_from_live += 1
 
         price = float(trade.price)
         qty = float(trade.qty)
@@ -403,6 +419,41 @@ class ContextService:
         payload["raw"] = self.exchange_info.raw
         return payload
 
+    def debug_trades_payload(self) -> Dict[str, Any]:
+        """Debug payload showing trade source tracking (backfill vs live)."""
+        total_trades = self.trades_from_backfill + self.trades_from_live
+        backfill_pct = (self.trades_from_backfill / total_trades * 100) if total_trades > 0 else 0
+        live_pct = (self.trades_from_live / total_trades * 100) if total_trades > 0 else 0
+
+        return {
+            "summary": {
+                "total_trades": self.trade_count,
+                "trades_from_backfill": self.trades_from_backfill,
+                "trades_from_live": self.trades_from_live,
+                "live_trades_rejected": self.live_trades_rejected,
+                "backfill_percentage": backfill_pct,
+                "live_percentage": live_pct,
+            },
+            "configuration": {
+                "context_disable_live_data": self.settings.context_disable_live_data,
+                "context_historical_only_mode": self.settings.context_historical_only_mode,
+                "backfill_complete": self.backfill_complete,
+            },
+            "vwap_debug": {
+                "sum_price_qty": self.sum_price_qty_base,
+                "sum_qty": self.sum_qty_base,
+                "vwap": self._current_vwap("base"),
+                "poc": self.poc_price,
+            },
+            "volumes": {
+                "total_volume": self.total_volume,
+                "pre_market_buy": self.pre_market_buy_volume,
+                "pre_market_sell": self.pre_market_sell_volume,
+                "live_buy": self.live_buy_volume,
+                "live_sell": self.live_sell_volume,
+            },
+        }
+
     def get_backfill_status(self) -> Dict[str, Any]:
         """Get the current status of background backfill."""
         # Return progress info with enhanced status
@@ -508,8 +559,39 @@ class ContextService:
         self.backfill_progress["current"] = self.backfill_progress.get("total", self.backfill_progress.get("current", 0))
         self.backfill_progress["percentage"] = 100.0
         self.backfill_progress["estimated_seconds_remaining"] = 0
+        
+        # Enhanced logging with detailed verification
         logger.info("✅ Backfill complete! TRADING NOW ENABLED")
         logger.info("📊 Metrics are now PRECISE and ready for trading")
+        logger.info(
+            "📈 BACKFILL SUMMARY - Trades=%d (backfill=%d, live=%d, rejected=%d), "
+            "VWAP=%s, POC=%s, Volume=%s, DayHigh=%s, DayLow=%s",
+            self.trade_count,
+            self.trades_from_backfill,
+            self.trades_from_live,
+            self.live_trades_rejected,
+            self._format_float(self._current_vwap("base")),
+            self._format_float(self.poc_price),
+            self._format_float(self.total_volume),
+            self._format_float(self.day_high),
+            self._format_float(self.day_low),
+        )
+        logger.info(
+            "💼 VOLUMES - PreMarketBuy=%s, PreMarketSell=%s, LiveBuy=%s, LiveSell=%s",
+            self._format_float(self.pre_market_buy_volume),
+            self._format_float(self.pre_market_sell_volume),
+            self._format_float(self.live_buy_volume),
+            self._format_float(self.live_sell_volume),
+        )
+        logger.info(
+            "📊 PREVIOUS DAY - PDH=%s, PDL=%s, VAH=%s, VAL=%s, POC=%s, VWAP=%s",
+            self._format_float(self.prev_day_levels.get("PDH")),
+            self._format_float(self.prev_day_levels.get("PDL")),
+            self._format_float(self.prev_day_levels.get("VAHprev")),
+            self._format_float(self.prev_day_levels.get("VALprev")),
+            self._format_float(self.prev_day_levels.get("POCprev")),
+            self._format_float(self.prev_day_levels.get("VWAPprev")),
+        )
 
     def _update_backfill_progress(self, current: int, total: int, start_time: Optional[float] = None) -> None:
         """Update backfill progress tracking."""
@@ -529,11 +611,15 @@ class ContextService:
         if total > 0 and current % max(1, total // 10) == 0:
             vwap = self._current_vwap("base")
             logger.info(
-                "Backfill progress: %d/%d chunks (%.1f%%), VWAP=%s (partial)",
+                "Backfill progress: %d/%d chunks (%.1f%%), trades=%d (backfill=%d), "
+                "VWAP=%s, POC=%s (partial)",
                 current,
                 total,
                 self.backfill_progress["percentage"],
+                self.trade_count,
+                self.trades_from_backfill,
                 self._format_float(vwap),
+                self._format_float(self.poc_price),
             )
 
     def _session_state(self, now: datetime) -> Dict[str, Any]:
@@ -876,7 +962,7 @@ class ContextService:
                     
                     if total_trades > 0:
                         for trade in trades:
-                            self.ingest_trade(trade)
+                            self.ingest_trade(trade, from_backfill=True)
                             
                             if chunk_duration and chunk_duration > 0:
                                 trade_time_seconds = max(0.0, (trade.ts - start_dt).total_seconds())
@@ -963,7 +1049,7 @@ class ContextService:
         last_reported_chunk = self.backfill_progress.get("current", 0)
         
         async for trade in provider.iterate_trades(start, end):
-            self.ingest_trade(trade)
+            self.ingest_trade(trade, from_backfill=True)
             trade_count += 1
             
             if chunk_duration and chunk_duration > 0:
