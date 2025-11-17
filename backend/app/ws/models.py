@@ -188,6 +188,13 @@ class Settings:
     bybit_connector_testnet: bool = field(
         default_factory=lambda: _env_bool("BYBIT_CONNECTOR_TESTNET", "false")
     )
+    # Historical data verification mode
+    context_disable_live_data: bool = field(
+        default_factory=lambda: _env_bool("CONTEXT_DISABLE_LIVE_DATA", "false")
+    )
+    context_historical_only_mode: bool = field(
+        default_factory=lambda: _env_bool("CONTEXT_HISTORICAL_ONLY_MODE", "false")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
