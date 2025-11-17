@@ -10,4 +10,12 @@ polars==1.7.1
 pydantic==2.8.2
 pandas-ta>=0.3.14b0
 pyarrow>=15.0.0
-hftbacktest>=0.4.0
+hftbacktest==2.4.3
+
+# Note: hftbacktest.live feature requires building from source with Rust dependencies
+# Current installation uses mock implementation for live functionality
+# To build with live feature: 
+#   pip install maturin rust
+#   git clone https://github.com/nkaz001/hftbacktest.git
+#   cd hftbacktest/py-hftbacktest
+#   maturin develop --features live
