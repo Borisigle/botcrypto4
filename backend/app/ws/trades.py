@@ -8,10 +8,6 @@ from .client import BaseStreamService, structured_log
 from .metrics import MetricsRecorder
 from .models import Settings, TradeSide, TradeTick
 
-if TYPE_CHECKING:
-    from app.context.service import ContextService
-
-
 def parse_trade_message(message: Dict[str, Any]) -> TradeTick:
     """Normalize a Binance aggTrade/trade payload."""
 
@@ -43,11 +39,9 @@ class TradeStream(BaseStreamService):
         self,
         settings: Settings,
         metrics: MetricsRecorder,
-        context_service: Optional["ContextService"] = None,
     ) -> None:
         super().__init__("trades", settings.trades_ws_url or "", settings)
         self.metrics = metrics
-        self.context_service = context_service
         self._strategy_engine = None
 
     def set_strategy_engine(self, strategy_engine) -> None:
@@ -73,24 +67,10 @@ class TradeStream(BaseStreamService):
 
         self.state.last_ts = tick.ts
         self.metrics.record_trade()
-        if self.context_service:
-            self.context_service.ingest_trade(tick)
         
         # Forward to strategy engine if available
         if self._strategy_engine:
             self._strategy_engine.ingest_trade(tick)
-        
-        # Forward to OrderFlowAnalyzer for real-time metrics
-        try:
-            from app.strategy.analyzers.orderflow import get_orderflow_analyzer
-            analyzer = get_orderflow_analyzer()
-            analyzer.ingest_trade(tick)
-        except Exception as exc:
-            structured_log(
-                self.logger,
-                "orderflow_ingest_error",
-                error=str(exc),
-            )
         
         lag_ms = (datetime.now(timezone.utc) - tick.ts).total_seconds() * 1000
         structured_log(

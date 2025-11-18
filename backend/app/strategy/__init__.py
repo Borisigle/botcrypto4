@@ -1,1 +1,0 @@
-"""Strategy framework for trading analysis and execution."""
