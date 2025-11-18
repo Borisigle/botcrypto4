@@ -7,17 +7,15 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..services.trade_service import TradeService
-from ..ws.models import get_settings
+from ..ws.routes import get_ws_module
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 
 
 def get_trade_service() -> TradeService:
-    """Dependency to get trade service instance."""
-    # In a real application, this would be a singleton managed by the app
-    # For now, we'll create it on demand
-    settings = get_settings()
-    return TradeService(settings)
+    """Dependency to get trade service instance from WSModule."""
+    ws_module = get_ws_module()
+    return ws_module.trade_service
 
 
 @router.get("")

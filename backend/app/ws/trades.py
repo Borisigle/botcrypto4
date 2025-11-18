@@ -43,10 +43,15 @@ class TradeStream(BaseStreamService):
         super().__init__("trades", settings.trades_ws_url or "", settings)
         self.metrics = metrics
         self._strategy_engine = None
+        self._trade_service = None
 
     def set_strategy_engine(self, strategy_engine) -> None:
         """Set the strategy engine reference for trade forwarding."""
         self._strategy_engine = strategy_engine
+        
+    def set_trade_service(self, trade_service) -> None:
+        """Set the trade service reference for trade buffering."""
+        self._trade_service = trade_service
 
     async def handle_payload(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -71,6 +76,18 @@ class TradeStream(BaseStreamService):
         # Forward to strategy engine if available
         if self._strategy_engine:
             self._strategy_engine.ingest_trade(tick)
+        
+        # Forward to trade service if available
+        if self._trade_service:
+            trade_data = {
+                "price": tick.price,
+                "qty": tick.qty,
+                "side": "Buy" if tick.side == TradeSide.BUY else "Sell",
+                "time": tick.ts.isoformat(),
+                "symbol": self.settings.symbol,
+                "trade_id": str(tick.id),
+            }
+            await self._trade_service.add_trade(trade_data)
         
         lag_ms = (datetime.now(timezone.utc) - tick.ts).total_seconds() * 1000
         structured_log(

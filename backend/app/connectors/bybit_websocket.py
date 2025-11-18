@@ -72,10 +72,12 @@ class BybitWebSocketConnector:
         symbol: str = "BTCUSDT",
         buffer_size: int = 1000,
         testnet: bool = False,
+        on_trade_callback: Optional[callable] = None,
     ):
         self.symbol = symbol.upper()
         self.buffer_size = buffer_size
         self.testnet = testnet
+        self.on_trade_callback = on_trade_callback
         
         # WebSocket URL based on testnet setting
         if testnet:
@@ -231,6 +233,10 @@ class BybitWebSocketConnector:
                 self._trades_buffer.append(trade)
                 self._last_trade_time = trade.time
                 
+                # Call the callback if provided
+                if self.on_trade_callback:
+                    await self.on_trade_callback(trade.to_dict())
+                
                 lag_ms = (datetime.now(timezone.utc) - trade.time).total_seconds() * 1000
                 structured_log(
                     self.logger,
@@ -300,10 +306,28 @@ class BybitWebSocketStream(BaseStreamService):
         self.metrics = metrics
         self._connector: Optional[BybitWebSocketConnector] = None
         self._strategy_engine = None
+        self._trade_service = None
         
     def set_strategy_engine(self, strategy_engine) -> None:
         """Set the strategy engine reference for trade forwarding."""
         self._strategy_engine = strategy_engine
+        
+    def set_trade_service(self, trade_service) -> None:
+        """Set the trade service reference for trade buffering."""
+        self._trade_service = trade_service
+        
+    async def _on_trade_received(self, trade_data: dict) -> None:
+        """Callback when a trade is received from the connector."""
+        # Forward to trade service if available
+        if self._trade_service:
+            await self._trade_service.add_trade(trade_data)
+            structured_log(
+                self.logger,
+                "trade_added_to_service",
+                price=trade_data.get("price"),
+                qty=trade_data.get("qty"),
+                side=trade_data.get("side"),
+            )
         
     async def on_start(self) -> None:
         """Initialize Bybit WebSocket connector."""
@@ -311,6 +335,7 @@ class BybitWebSocketStream(BaseStreamService):
             symbol=self.settings.symbol,
             buffer_size=self.settings.max_queue,
             testnet=self.settings.bybit_connector_testnet,
+            on_trade_callback=self._on_trade_received,
         )
         await self._connector.connect()
         
