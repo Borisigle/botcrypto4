@@ -195,6 +195,9 @@ class Settings:
     context_historical_only_mode: bool = field(
         default_factory=lambda: _env_bool("CONTEXT_HISTORICAL_ONLY_MODE", "false")
     )
+    cvd_reset_seconds: int = field(
+        default_factory=lambda: int(os.getenv("CVD_RESET_SECONDS", "3600"))
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
