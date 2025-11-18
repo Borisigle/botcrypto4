@@ -1,133 +1,78 @@
-# Botcrypto4 Monorepo Scaffold
+# Crypto Trading Bot - Order Flow + Liquidation Sweeps
 
-This repository provides a minimal monorepo scaffold featuring a Next.js 14 frontend and a FastAPI backend, wired together with Docker for local development.
+## 🎯 Estrategia
 
-## Prerequisites
+### Setup
+- **Detección**: Liquidation sweeps en tiempo real
+- **Confirmación**: CVD divergencia + Volume Delta spike
+- **Entrada**: Cuando precio toca/rompe liquidation cluster y CVD confirma
+- **SL**: Justo abajo del liquidation wall
+- **TP**: Resistencia o siguiente liquidation cluster
+- **RR objetivo**: 1:5 a 1:10
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (includes Docker Compose)
-- (Optional) Make if you prefer the provided make targets
+### Timeframe
+- **Macro**: Daily/4H (contexto, verificar 1-2 veces/día)
+- **Micro**: 5-15 min (ejecución)
+- **Duration**: 30 seg a 2 min por operación (scalping)
 
-## Getting Started
+### Filters Críticos
+- ✓ Funding rate: Si > ±0.15% → SKIP
+- ✓ Volumen día: Si < 50% promedio → SKIP
+- ✓ Market extremo: Si pánico/euphoria → SKIP
 
-1. **Clone the repository** and move into the project directory.
+## 🏗️ Arquitectura
 
-2. **Configure environment variables**:
+### Backend (FastAPI)
+- **WebSocket**: Conecta Bybit/Binance trades en vivo
+- **Indicadores**: CVD, Volume Delta (tiempo real)
+- **Liquidations**: Fetch API cada 10 seg
+- **Strategy Engine**: Detecta setups + calcula entrada/SL/TP
+- **Alerts**: Genera señal cuando hay confluencia
 
-   ```bash
-   cp .env.example .env
-   cp frontend/.env.local.example frontend/.env.local
-   cp backend/.env.example backend/.env
-   ```
+### Frontend (Next.js)
+- **Dashboard**: Charts CVD, Volume Delta, Liquidations
+- **Real-time**: WebSocket updates
+- **Alerts**: Notificación cuando hay setup
+- **Signals**: Mostra entrada/SL/TP recomendado
+- **Manual Execution**: Botón para ir al exchange (tú ejecutas)
 
-   You can edit the copied files to customise ports or API URLs. By default the frontend expects the backend at `http://localhost:8000` when running outside Docker, and `http://backend:8000` when running inside Docker Compose.
+## 📊 Indicadores Implementados
 
-3. **Start the stack**:
+- [ ] CVD (Cumulative Volume Delta)
+- [ ] Volume Delta (buy vs sell)
+- [ ] Liquidation clusters por precio
+- [ ] Sweep detector
+- [ ] Entrada/SL/TP calculator
+- [ ] Macro filters (funding, volume)
 
-   ```bash
-   docker compose up --build
-   ```
+## 🚀 Roadmap
 
-   Or, using the provided make targets:
+### Phase 1: Foundation (T2-T3)
+- T2: WebSocket connector Bybit
+- T3: API /trades endpoint
 
-   ```bash
-   make up
-   ```
+### Phase 2: Indicadores (T4-T5)
+- T4: CVD calculator
+- T5: Volume Delta
 
-4. **Verify everything is running**:
+### Phase 3: Data (T6-T7)
+- T6: Liquidation tracker
+- T7: Macro filters
 
-   - Frontend: <http://localhost:3000>
-   - Backend health: <http://localhost:8000/health> (returns `{ "status": "ok" }`)
-   - Backend readiness: <http://localhost:8000/ready> (session state, backfill progress, trading flags)
+### Phase 4: Strategy (T8)
+- T8: Sweep detector + engine
 
-   The homepage displays the backend health in real time by calling the FastAPI `/health` endpoint.
+### Phase 5: Frontend (T9-T11)
+- T9: Dashboard
+- T10: Real-time charts
+- T11: Alerts + signals
 
-## Project Structure
+## 🔄 Stack
 
-```
-.
-├── backend
-│   ├── Dockerfile
-│   ├── app
-│   │   ├── __init__.py
-│   │   ├── main.py
-│   │   ├── context/          # Context service for market metrics
-│   │   ├── strategy/         # Strategy framework for trading analysis
-│   │   │   ├── engine.py     # Main strategy orchestrator
-│   │   │   ├── scheduler.py  # Session management (London/Overlap)
-│   │   │   ├── models.py     # Data models and enums
-│   │   │   ├── routes.py     # FastAPI endpoints
-│   │   │   └── analyzers/    # Market regime detection
-│   │   │       └── context.py
-│   │   ├── tests/            # Test suite
-│   │   └── ws/              # WebSocket data ingestion
-│   ├── .env.example
-│   └── requirements.txt
-├── frontend
-│   ├── Dockerfile
-│   ├── app
-│   │   ├── globals.css
-│   │   ├── layout.tsx
-│   │   └── page.tsx
-│   ├── .env.local.example
-│   ├── next-env.d.ts
-│   ├── next.config.js
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── .eslintrc.json
-├── docker-compose.yml
-├── .env.example
-├── .gitignore
-├── Makefile
-├── README.md
-└── .prettierrc
-```
+- **Backend**: FastAPI, Python 3.11+
+- **Frontend**: Next.js, TypeScript, React
+- **Data**: WebSocket (Bybit), REST APIs
+- **DB**: PostgreSQL (si necesario)
 
-## Scripts
-
-Inside `frontend`:
-
-- `npm run dev` – Start Next.js dev server (binds to `0.0.0.0:3000`)
-- `npm run build` – Production build
-- `npm run start` – Start Next.js in production mode
-- `npm run lint` – Run ESLint
-- `npm run format` – Format the project with Prettier
-
-Inside `backend` (outside Docker):
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-## Strategy Framework
-
-The backend includes a comprehensive strategy framework for real-time trading analysis:
-
-### Key Features
-- **Session Management**: London (08:00-12:00 UTC) and NY overlap (13:00-17:00 UTC) trading sessions
-- **Real-time Candle Aggregation**: Configurable timeframes (1m, 5m) from live trade data
-- **Market Regime Detection**: Context analyzer classifies range vs trend markets
-- **Event System**: Pub/sub interface for strategy components
-- **REST API**: Endpoints for strategy status, candles, and analysis diagnostics
-
-### API Endpoints
-- `/strategy/status` - Current strategy engine state and market analysis
-- `/strategy/candles` - Historical candle data by timeframe
-- `/strategy/analysis/diagnostics` - Detailed market regime diagnostics
-- `/ready` - Backend readiness (session state, backfill progress, trading flags)
-- `/context` - Live market context metrics (VWAP, POC, volume profile)
-- `/ws/health` - WebSocket stream health status
-
-For detailed documentation, see `backend/app/strategy/README.md`.
-
-## Stopping & Logs
-
-- Stop services: `docker compose down` or `make down`
-- Follow logs: `docker compose logs -f` or `make logs`
-
-## Notes
-
-- The backend enables CORS for `http://localhost:3000` by default. Adjust `CORS_ALLOW_ORIGINS` in `backend/.env` if you need to serve the frontend from a different origin.
-- `NEXT_PUBLIC_API_URL` defaults to `http://localhost:8000` so the frontend can reach the backend when running outside Docker. When running within Docker Compose, the service is set to `http://backend:8000` automatically.
+## 📝 Próximo paso
+[Se actualiza después de cada merge]
