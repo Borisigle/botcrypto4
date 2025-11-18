@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 
 from ..connectors.bybit_websocket import BybitWebSocketStream
+from ..services.trade_service import TradeService
 from .depth import DepthStream
 from .metrics import MetricsRecorder
 from .models import MetricsSnapshot, StreamHealth, get_settings
@@ -26,6 +27,9 @@ class WSModule:
         self.metrics = MetricsRecorder(self.settings.metrics_window_sec)
         self._strategy_engine = None
 
+        # Initialize trade service (shared buffer for all streams)
+        self.trade_service = TradeService(self.settings)
+
         # Initialize trade stream based on data source
         self.trade_stream: Optional[TradeStream] = None
         self.bybit_trade_stream: Optional[BybitWebSocketStream] = None
@@ -35,12 +39,16 @@ class WSModule:
                 self.settings,
                 self.metrics,
             )
+            # Connect trade service to the stream
+            self.bybit_trade_stream.set_trade_service(self.trade_service)
         else:
             # Default: Binance WebSocket
             self.trade_stream = TradeStream(
                 self.settings,
                 self.metrics,
             )
+            # Connect trade service to the stream
+            self.trade_stream.set_trade_service(self.trade_service)
             
         self.depth_stream = DepthStream(self.settings, self.metrics)
 

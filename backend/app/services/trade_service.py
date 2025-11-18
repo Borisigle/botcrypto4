@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,7 @@ class TradeService:
         self._trades_buffer: deque[Dict[str, Any]] = deque(maxlen=self._buffer_size)
         self._bybit_connector: Optional[BybitWebSocketConnector] = None
         self._lock = asyncio.Lock()
+        self.logger = logging.getLogger("trade_service")
         
     async def start_bybit_connector(self) -> None:
         """Start Bybit WebSocket connector."""
@@ -40,6 +42,11 @@ class TradeService:
         """Add a trade to the buffer."""
         async with self._lock:
             self._trades_buffer.append(trade_data)
+            self.logger.info(
+                f"Trade added: price={trade_data.get('price')}, "
+                f"qty={trade_data.get('qty')}, side={trade_data.get('side')}, "
+                f"buffer_size={len(self._trades_buffer)}"
+            )
             
     def get_recent_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Get most recent trades from buffer."""
@@ -68,7 +75,7 @@ class TradeService:
                 "total_count": 0,
                 "oldest_trade_time": None,
                 "newest_trade_time": None,
-                "bybit_connected": False,
+                "buffer_size": self._buffer_size,
             }
             
         trades_list = list(self._trades_buffer)
@@ -78,7 +85,7 @@ class TradeService:
             "total_count": len(trades_list),
             "oldest_trade_time": trades_list[0]["time"],
             "newest_trade_time": trades_list[-1]["time"],
-            "bybit_connected": self._bybit_connector.is_connected if self._bybit_connector else False,
+            "buffer_size": self._buffer_size,
         }
         
     @property
