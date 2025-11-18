@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routers.trades import router as trades_router
 from app.ws.models import get_settings
 from app.ws.routes import get_ws_module, router as ws_router
 
@@ -34,6 +35,7 @@ app.add_middleware(
 )
 
 app.include_router(ws_router)
+app.include_router(trades_router)
 
 ws_module = get_ws_module()
 
@@ -50,8 +52,10 @@ async def shutdown_event() -> None:
 
 @app.get("/health")
 async def health() -> dict:
+    ws_health = ws_module.health_payload()
     return {
         "status": "Healthy",
+        "websocket_connected": ws_health.get("trades", {}).get("connected", False),
     }
 
 
