@@ -245,3 +245,64 @@ def test_endpoint_construction_with_trailing_slash() -> None:
     )
     
     assert service.endpoint == "https://fapi.binance.com/fapi/v1/forceOrders"
+
+
+def test_liquidation_service_with_authentication() -> None:
+    """Test LiquidationService initialization with API credentials."""
+    service = LiquidationService(
+        symbol="BTCUSDT",
+        api_key="test_api_key",
+        api_secret="test_api_secret"
+    )
+    
+    assert service.signer is not None
+    assert service.signer.api_key == "test_api_key"
+    assert service.signer.api_secret == "test_api_secret"
+
+
+def test_liquidation_service_without_authentication() -> None:
+    """Test LiquidationService initialization without API credentials."""
+    service = LiquidationService(symbol="BTCUSDT")
+    
+    assert service.signer is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_liquidations_with_authentication() -> None:
+    """Test that authenticated requests include proper headers and signatures."""
+    service = LiquidationService(
+        symbol="BTCUSDT",
+        api_key="test_api_key",
+        api_secret="test_api_secret"
+    )
+    
+    mock_response_data = [
+        {"symbol": "BTCUSDT", "price": "91500", "origQty": "10.5", "side": "SELL"},
+    ]
+    
+    mock_response = MagicMock()
+    mock_response.json.return_value = mock_response_data
+    mock_response.raise_for_status = MagicMock()
+    
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    
+    with patch("app.services.liquidation_service.httpx.AsyncClient") as mock_client_class:
+        mock_client_class.return_value.__aenter__.return_value = mock_client
+        mock_client_class.return_value.__aexit__.return_value = None
+        
+        await service.fetch_liquidations()
+    
+    # Verify authentication was applied
+    assert mock_client.get.called
+    call_kwargs = mock_client.get.call_args.kwargs
+    
+    # Check headers include API key
+    assert "headers" in call_kwargs
+    assert call_kwargs["headers"]["X-MBX-APIKEY"] == "test_api_key"
+    
+    # Check params include signature and timestamp
+    params = call_kwargs["params"]
+    assert "signature" in params
+    assert "timestamp" in params
+    assert params["symbol"] == "BTCUSDT"
