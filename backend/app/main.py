@@ -1,11 +1,16 @@
+import asyncio
 import logging
 import os
+from contextlib import suppress
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routers.indicators import router as indicators_router
 from app.routers.trades import router as trades_router
+from app.services.cvd_service import init_cvd_service, get_cvd_service
 from app.ws.models import get_settings
 from app.ws.routes import get_ws_module, router as ws_router
 
@@ -36,17 +41,57 @@ app.add_middleware(
 
 app.include_router(ws_router)
 app.include_router(trades_router)
+app.include_router(indicators_router)
 
 ws_module = get_ws_module()
+_cvd_reset_task: Optional[asyncio.Task] = None
+logger = logging.getLogger("main")
+
+
+async def _cvd_auto_reset_loop() -> None:
+    """Background task that periodically checks and resets CVD if needed."""
+    loop_logger = logging.getLogger("cvd_service")
+    loop_logger.info("CVD auto-reset loop started (check_interval=%ss)", 60)
+    while True:
+        try:
+            await asyncio.sleep(60)
+            cvd_service = get_cvd_service()
+            if cvd_service.maybe_reset():
+                loop_logger.info("CVD auto-reset executed")
+        except asyncio.CancelledError:
+            loop_logger.info("CVD auto-reset loop cancelled")
+            break
+        except Exception:
+            loop_logger.exception("CVD auto-reset loop encountered an error")
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    global _cvd_reset_task
+
+    init_cvd_service(reset_period_seconds=settings.cvd_reset_seconds)
+    logger.info(
+        "CVD service initialized (reset_period=%ss)",
+        settings.cvd_reset_seconds,
+    )
+
     await ws_module.startup()
+
+    _cvd_reset_task = asyncio.create_task(_cvd_auto_reset_loop())
+    logger.info("CVD auto-reset background task started")
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    global _cvd_reset_task
+
+    if _cvd_reset_task:
+        _cvd_reset_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _cvd_reset_task
+        logger.info("CVD auto-reset background task stopped")
+        _cvd_reset_task = None
+
     await ws_module.shutdown()
 
 
