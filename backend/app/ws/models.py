@@ -199,7 +199,7 @@ class Settings:
         default_factory=lambda: int(os.getenv("CVD_RESET_SECONDS", "3600"))
     )
     liquidation_symbol: str = field(
-        default_factory=lambda: os.getenv("LIQUIDATION_SYMBOL", "BTCUSDT")
+        default_factory=lambda: os.getenv("LIQUIDATION_SYMBOL", "BTC")
     )
     liquidation_limit: int = field(
         default_factory=lambda: int(os.getenv("LIQUIDATION_LIMIT", "200"))
@@ -217,13 +217,13 @@ class Settings:
         default_factory=lambda: os.getenv("LIQUIDATION_CATEGORY") or None
     )
     liquidation_base_url: str = field(
-        default_factory=lambda: os.getenv("LIQUIDATION_BASE_URL", "https://fapi.binance.com")
+        default_factory=lambda: os.getenv("LIQUIDATION_BASE_URL", "https://open-api.coinglass.com")
     )
     liquidation_api_key: Optional[str] = field(
-        default_factory=lambda: os.getenv("LIQUIDATION_API_KEY") or os.getenv("BINANCE_API_KEY")
+        default_factory=lambda: os.getenv("LIQUIDATION_API_KEY")
     )
     liquidation_api_secret: Optional[str] = field(
-        default_factory=lambda: os.getenv("LIQUIDATION_API_SECRET") or os.getenv("BINANCE_API_SECRET")
+        default_factory=lambda: os.getenv("LIQUIDATION_API_SECRET")
     )
 
     def __post_init__(self) -> None:

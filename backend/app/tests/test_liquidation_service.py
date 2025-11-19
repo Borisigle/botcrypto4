@@ -1,4 +1,4 @@
-"""Tests for liquidation service with Binance API."""
+"""Tests for liquidation service with Coinglass API."""
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -10,32 +10,32 @@ from app.services.liquidation_service import LiquidationService
 def liquidation_service():
     """Create a LiquidationService instance."""
     return LiquidationService(
-        symbol="BTCUSDT",
+        symbol="BTC",
         limit=200,
         bin_size=100.0,
         max_clusters=20,
-        base_url="https://fapi.binance.com",
+        base_url="https://open-api.coinglass.com",
     )
 
 
 def test_liquidation_service_init(liquidation_service: LiquidationService) -> None:
     """Test LiquidationService initialization."""
-    assert liquidation_service.symbol == "BTCUSDT"
+    assert liquidation_service.symbol == "BTC"
     assert liquidation_service.limit == 200
     assert liquidation_service.bin_size == 100.0
     assert liquidation_service.max_clusters == 20
-    assert liquidation_service.endpoint == "https://fapi.binance.com/fapi/v1/forceOrders"
+    assert liquidation_service.endpoint == "https://open-api.coinglass.com/public/v2/liquidation/latest"
     assert liquidation_service.liquidations == []
     assert liquidation_service.clusters == {}
 
 
-def test_normalize_liquidation_binance_format() -> None:
-    """Test normalization of Binance force order format."""
+def test_normalize_liquidation_coinglass_format() -> None:
+    """Test normalization of Coinglass liquidation format."""
     entry = {
-        "symbol": "BTCUSDT",
+        "symbol": "BTC",
         "price": "50000.5",
-        "origQty": "1.5",
-        "side": "SELL"
+        "amount": "1.5",
+        "type": "short"
     }
     
     result = LiquidationService._normalize_liquidation(entry)
@@ -46,13 +46,13 @@ def test_normalize_liquidation_binance_format() -> None:
     assert result["side"] == "sell"
 
 
-def test_normalize_liquidation_with_qty_fallback() -> None:
-    """Test normalization with qty as fallback."""
+def test_normalize_liquidation_coinglass_long() -> None:
+    """Test normalization of long liquidation (buy)."""
     entry = {
-        "symbol": "BTCUSDT",
+        "symbol": "BTC",
         "price": "50000.5",
-        "qty": "1.5",
-        "side": "BUY"
+        "amount": "1.5",
+        "type": "long"
     }
     
     result = LiquidationService._normalize_liquidation(entry)
@@ -66,10 +66,10 @@ def test_normalize_liquidation_with_qty_fallback() -> None:
 def test_normalize_liquidation_invalid_qty() -> None:
     """Test normalization with invalid quantity."""
     entry = {
-        "symbol": "BTCUSDT",
+        "symbol": "BTC",
         "price": "50000.5",
-        "origQty": "0",
-        "side": "SELL"
+        "amount": "0",
+        "type": "short"
     }
     
     result = LiquidationService._normalize_liquidation(entry)
@@ -78,12 +78,12 @@ def test_normalize_liquidation_invalid_qty() -> None:
 
 
 def test_normalize_liquidation_invalid_side() -> None:
-    """Test normalization with invalid side."""
+    """Test normalization with invalid type."""
     entry = {
-        "symbol": "BTCUSDT",
+        "symbol": "BTC",
         "price": "50000.5",
-        "origQty": "1.5",
-        "side": "INVALID"
+        "amount": "1.5",
+        "type": "invalid"
     }
     
     result = LiquidationService._normalize_liquidation(entry)
@@ -94,10 +94,10 @@ def test_normalize_liquidation_invalid_side() -> None:
 def test_normalize_liquidation_non_numeric_price() -> None:
     """Test normalization with non-numeric price."""
     entry = {
-        "symbol": "BTCUSDT",
+        "symbol": "BTC",
         "price": "invalid",
-        "origQty": "1.5",
-        "side": "SELL"
+        "amount": "1.5",
+        "type": "short"
     }
     
     result = LiquidationService._normalize_liquidation(entry)
@@ -107,12 +107,16 @@ def test_normalize_liquidation_non_numeric_price() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_liquidations_success(liquidation_service: LiquidationService) -> None:
-    """Test successful liquidation fetch from Binance."""
-    mock_response_data = [
-        {"symbol": "BTCUSDT", "price": "91500", "origQty": "10.5", "side": "SELL"},
-        {"symbol": "BTCUSDT", "price": "91500.5", "origQty": "5.2", "side": "BUY"},
-        {"symbol": "BTCUSDT", "price": "91600", "origQty": "8.3", "side": "SELL"},
-    ]
+    """Test successful liquidation fetch from Coinglass."""
+    mock_response_data = {
+        "code": "0",
+        "msg": "success",
+        "data": [
+            {"symbol": "BTC", "price": "91500", "amount": "10.5", "type": "short"},
+            {"symbol": "BTC", "price": "91500.5", "amount": "5.2", "type": "long"},
+            {"symbol": "BTC", "price": "91600", "amount": "8.3", "type": "short"},
+        ]
+    }
     
     mock_response = MagicMock()
     mock_response.json.return_value = mock_response_data
@@ -153,7 +157,7 @@ async def test_fetch_liquidations_http_error(liquidation_service: LiquidationSer
 async def test_fetch_liquidations_empty_response(liquidation_service: LiquidationService) -> None:
     """Test liquidation fetch with empty response."""
     mock_response = MagicMock()
-    mock_response.json.return_value = []
+    mock_response.json.return_value = {"code": "0", "msg": "success", "data": []}
     mock_response.raise_for_status = MagicMock()
     
     mock_client = AsyncMock()
@@ -228,57 +232,55 @@ def test_get_clusters_sorted(liquidation_service: LiquidationService) -> None:
 
 
 def test_endpoint_construction() -> None:
-    """Test that endpoint is constructed correctly for Binance."""
+    """Test that endpoint is constructed correctly for Coinglass."""
     service = LiquidationService(
-        base_url="https://fapi.binance.com",
-        symbol="BTCUSDT"
+        base_url="https://open-api.coinglass.com",
+        symbol="BTC"
     )
     
-    assert service.endpoint == "https://fapi.binance.com/fapi/v1/forceOrders"
+    assert service.endpoint == "https://open-api.coinglass.com/public/v2/liquidation/latest"
 
 
 def test_endpoint_construction_with_trailing_slash() -> None:
     """Test endpoint construction handles trailing slash."""
     service = LiquidationService(
-        base_url="https://fapi.binance.com/",
-        symbol="BTCUSDT"
+        base_url="https://open-api.coinglass.com/",
+        symbol="BTC"
     )
     
-    assert service.endpoint == "https://fapi.binance.com/fapi/v1/forceOrders"
+    assert service.endpoint == "https://open-api.coinglass.com/public/v2/liquidation/latest"
 
 
-def test_liquidation_service_with_authentication() -> None:
-    """Test LiquidationService initialization with API credentials."""
+def test_liquidation_service_ignores_authentication() -> None:
+    """Test LiquidationService ignores API credentials (Coinglass is public)."""
     service = LiquidationService(
-        symbol="BTCUSDT",
+        symbol="BTC",
         api_key="test_api_key",
         api_secret="test_api_secret"
     )
     
-    assert service.signer is not None
-    assert service.signer.api_key == "test_api_key"
-    assert service.signer.api_secret == "test_api_secret"
+    assert not hasattr(service, 'signer') or service.signer is None
 
 
-def test_liquidation_service_without_authentication() -> None:
-    """Test LiquidationService initialization without API credentials."""
-    service = LiquidationService(symbol="BTCUSDT")
+def test_liquidation_service_no_authentication_needed() -> None:
+    """Test LiquidationService works without API credentials (Coinglass is public)."""
+    service = LiquidationService(symbol="BTC")
     
-    assert service.signer is None
+    assert not hasattr(service, 'signer') or service.signer is None
 
 
 @pytest.mark.asyncio
-async def test_fetch_liquidations_with_authentication() -> None:
-    """Test that authenticated requests include proper headers and signatures."""
-    service = LiquidationService(
-        symbol="BTCUSDT",
-        api_key="test_api_key",
-        api_secret="test_api_secret"
-    )
+async def test_fetch_liquidations_public_api() -> None:
+    """Test that public requests include User-Agent header."""
+    service = LiquidationService(symbol="BTC")
     
-    mock_response_data = [
-        {"symbol": "BTCUSDT", "price": "91500", "origQty": "10.5", "side": "SELL"},
-    ]
+    mock_response_data = {
+        "code": "0",
+        "msg": "success",
+        "data": [
+            {"symbol": "BTC", "price": "91500", "amount": "10.5", "type": "short"},
+        ]
+    }
     
     mock_response = MagicMock()
     mock_response.json.return_value = mock_response_data
@@ -293,16 +295,16 @@ async def test_fetch_liquidations_with_authentication() -> None:
         
         await service.fetch_liquidations()
     
-    # Verify authentication was applied
+    # Verify public request includes User-Agent
     assert mock_client.get.called
     call_kwargs = mock_client.get.call_args.kwargs
     
-    # Check headers include API key
-    assert "headers" in call_kwargs
-    assert call_kwargs["headers"]["X-MBX-APIKEY"] == "test_api_key"
-    
-    # Check params include signature and timestamp
+    # Check params include symbol and limit
     params = call_kwargs["params"]
-    assert "signature" in params
-    assert "timestamp" in params
-    assert params["symbol"] == "BTCUSDT"
+    assert "symbol" in params
+    assert "limit" in params
+    assert params["symbol"] == "BTC"
+    
+    # Check headers include User-Agent
+    headers = call_kwargs.get("headers", {})
+    assert "User-Agent" in headers

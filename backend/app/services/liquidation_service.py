@@ -1,4 +1,4 @@
-"""Liquidation tracker service backed by Binance Futures API."""
+"""Liquidation tracker service backed by Coinglass API."""
 from __future__ import annotations
 
 import logging
@@ -9,23 +9,22 @@ from typing import Dict, List, Optional
 import httpx
 
 from app.models.indicators import LiquidationCluster, LiquidationSnapshot
-from app.utils.binance_signer import BinanceSigner
 
 ClusterBucket = Dict[str, float]
 
 
 class LiquidationService:
-    """Fetches liquidation data and builds price-level clusters."""
+    """Fetches liquidation data from Coinglass API and builds price-level clusters."""
 
     def __init__(
         self,
         *,
-        symbol: str = "BTCUSDT",
+        symbol: str = "BTC",
         limit: int = 200,
         bin_size: float = 100.0,
         max_clusters: int = 20,
         category: Optional[str] = None,
-        base_url: str = "https://fapi.binance.com",
+        base_url: str = "https://open-api.coinglass.com",
         http_timeout: float = 10.0,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
@@ -35,7 +34,7 @@ class LiquidationService:
         self.bin_size = bin_size if bin_size > 0 else 100.0
         self.max_clusters = max(1, max_clusters)
         self.category = category
-        self.endpoint = f"{base_url.rstrip('/')}/fapi/v1/forceOrders"
+        self.endpoint = f"{base_url.rstrip('/')}/public/v2/liquidation/latest"
         self.http_timeout = http_timeout
 
         self.liquidations: List[dict] = []
@@ -45,44 +44,42 @@ class LiquidationService:
         self.logger = logging.getLogger("liquidation_service")
         self._lock = Lock()
 
-        self.signer: Optional[BinanceSigner] = None
-        if api_key and api_secret:
-            self.signer = BinanceSigner(api_key, api_secret)
-            self.logger.info("Liquidation service initialized with authenticated API credentials")
-
     @property
     def last_updated(self) -> Optional[datetime]:
         with self._lock:
             return self._last_updated
 
     async def fetch_liquidations(self) -> None:
-        """Fetch the most recent liquidation events from Binance Futures API."""
+        """Fetch the most recent liquidation events from Coinglass API."""
 
         params = {
             "symbol": self.symbol,
             "limit": self.limit,
         }
 
-        headers = {}
-        if self.signer:
-            params = self.signer.sign_request(params)
-            headers["X-MBX-APIKEY"] = self.signer.api_key
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+        }
 
         try:
             async with httpx.AsyncClient(timeout=self.http_timeout) as client:
                 response = await client.get(self.endpoint, params=params, headers=headers)
                 response.raise_for_status()
         except httpx.HTTPError as exc:
-            self.logger.warning("Failed to fetch Binance liquidations: %s", exc)
+            self.logger.warning("Failed to fetch Coinglass liquidations: %s", exc)
             return
 
         try:
             data = response.json()
         except Exception as exc:
-            self.logger.warning("Failed to parse Binance liquidation response: %s", exc)
+            self.logger.warning("Failed to parse Coinglass liquidation response: %s", exc)
             return
 
-        liq_list = data if isinstance(data, list) else []
+        if data.get("code") != "0":
+            self.logger.warning("Coinglass error: %s", data.get("msg"))
+            return
+
+        liq_list = data.get("data", [])
         normalized = [entry for entry in (self._normalize_liquidation(item) for item in liq_list) if entry]
 
         with self._lock:
@@ -91,8 +88,7 @@ class LiquidationService:
             self._last_updated = datetime.now(timezone.utc)
             cluster_count = len(self.clusters)
 
-        auth_status = "authenticated" if self.signer else "unauthenticated"
-        self.logger.info("Liquidations fetched from Binance (%s): %s items", auth_status, len(normalized))
+        self.logger.info("Liquidations fetched from Coinglass: %s items", len(normalized))
         self.logger.debug("Liquidation clusters updated: unique_bins=%s", cluster_count)
 
     def _build_clusters_locked(self) -> None:
@@ -129,14 +125,21 @@ class LiquidationService:
     def _normalize_liquidation(entry: dict) -> Optional[dict]:
         try:
             price = float(entry.get("price"))
-            qty = float(entry.get("origQty", entry.get("qty")))
+            qty = float(entry.get("amount", entry.get("qty", entry.get("origQty"))))
         except (TypeError, ValueError):
             return None
 
         if qty <= 0:
             return None
 
-        side = str(entry.get("side", "")).lower()
+        liq_type = str(entry.get("type", "")).lower()
+        if liq_type == "long":
+            side = "buy"
+        elif liq_type == "short":
+            side = "sell"
+        else:
+            side = str(entry.get("side", "")).lower()
+        
         if side not in {"buy", "sell"}:
             return None
         return {"price": price, "qty": qty, "side": side}
@@ -207,26 +210,26 @@ _liquidation_service: Optional[LiquidationService] = None
 
 def init_liquidation_service(
     *,
-    symbol: str = "BTCUSDT",
+    symbol: str = "BTC",
     limit: int = 200,
     bin_size: float = 100.0,
     max_clusters: int = 20,
     category: Optional[str] = None,
-    base_url: str = "https://fapi.binance.com",
+    base_url: str = "https://open-api.coinglass.com",
     api_key: Optional[str] = None,
     api_secret: Optional[str] = None,
 ) -> LiquidationService:
-    """Initialize the liquidation service with optional authentication.
+    """Initialize the liquidation service using Coinglass API.
     
     Args:
-        symbol: Trading symbol (e.g., BTCUSDT)
+        symbol: Trading symbol (e.g., BTC, ETH)
         limit: Number of liquidations to fetch
         bin_size: Price bin size for clustering
         max_clusters: Maximum clusters to return
         category: Optional liquidation category
-        base_url: Binance API base URL
-        api_key: Optional Binance API key for authenticated requests
-        api_secret: Optional Binance API secret for authenticated requests
+        base_url: Coinglass API base URL
+        api_key: Unused (Coinglass API is public)
+        api_secret: Unused (Coinglass API is public)
     """
     global _liquidation_service
     if _liquidation_service is None:
@@ -237,8 +240,6 @@ def init_liquidation_service(
             max_clusters=max_clusters,
             category=category,
             base_url=base_url,
-            api_key=api_key,
-            api_secret=api_secret,
         )
     return _liquidation_service
 
