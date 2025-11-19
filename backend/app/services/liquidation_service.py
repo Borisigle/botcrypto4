@@ -1,4 +1,4 @@
-"""Liquidation tracker service backed by Bybit public API."""
+"""Liquidation tracker service backed by Binance Futures public API."""
 from __future__ import annotations
 
 import logging
@@ -23,8 +23,8 @@ class LiquidationService:
         limit: int = 200,
         bin_size: float = 100.0,
         max_clusters: int = 20,
-        category: Optional[str] = "linear",
-        base_url: str = "https://api.bybit.com",
+        category: Optional[str] = None,
+        base_url: str = "https://fapi.binance.com",
         http_timeout: float = 10.0,
     ) -> None:
         self.symbol = symbol.upper()
@@ -32,7 +32,7 @@ class LiquidationService:
         self.bin_size = bin_size if bin_size > 0 else 100.0
         self.max_clusters = max(1, max_clusters)
         self.category = category
-        self.endpoint = f"{base_url.rstrip('/')}/v5/market/liquidation"
+        self.endpoint = f"{base_url.rstrip('/')}/fapi/v1/forceOrders"
         self.http_timeout = http_timeout
 
         self.liquidations: List[dict] = []
@@ -48,33 +48,28 @@ class LiquidationService:
             return self._last_updated
 
     async def fetch_liquidations(self) -> None:
-        """Fetch the most recent liquidation events from Bybit."""
+        """Fetch the most recent liquidation events from Binance Futures API."""
 
         params = {
             "symbol": self.symbol,
             "limit": self.limit,
         }
-        if self.category:
-            params["category"] = self.category
 
         try:
             async with httpx.AsyncClient(timeout=self.http_timeout) as client:
                 response = await client.get(self.endpoint, params=params)
                 response.raise_for_status()
         except httpx.HTTPError as exc:
-            self.logger.warning("Failed to fetch Bybit liquidations: %s", exc)
+            self.logger.warning("Failed to fetch Binance liquidations: %s", exc)
             return
 
-        payload = response.json()
-        if payload.get("retCode") not in (0, "0", None):
-            self.logger.warning(
-                "Unexpected retCode from Bybit liquidation API: retCode=%s retMsg=%s",
-                payload.get("retCode"),
-                payload.get("retMsg"),
-            )
+        try:
+            data = response.json()
+        except Exception as exc:
+            self.logger.warning("Failed to parse Binance liquidation response: %s", exc)
             return
 
-        liq_list = payload.get("result", {}).get("list", []) or []
+        liq_list = data if isinstance(data, list) else []
         normalized = [entry for entry in (self._normalize_liquidation(item) for item in liq_list) if entry]
 
         with self._lock:
@@ -120,7 +115,7 @@ class LiquidationService:
     def _normalize_liquidation(entry: dict) -> Optional[dict]:
         try:
             price = float(entry.get("price"))
-            qty = float(entry.get("qty"))
+            qty = float(entry.get("origQty", entry.get("qty")))
         except (TypeError, ValueError):
             return None
 

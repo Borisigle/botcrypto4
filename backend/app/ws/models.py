@@ -214,10 +214,10 @@ class Settings:
         default_factory=lambda: int(os.getenv("LIQUIDATION_MAX_CLUSTERS", "20"))
     )
     liquidation_category: Optional[str] = field(
-        default_factory=lambda: os.getenv("LIQUIDATION_CATEGORY", "linear") or None
+        default_factory=lambda: os.getenv("LIQUIDATION_CATEGORY") or None
     )
     liquidation_base_url: str = field(
-        default_factory=lambda: os.getenv("LIQUIDATION_BASE_URL", "https://api.bybit.com")
+        default_factory=lambda: os.getenv("LIQUIDATION_BASE_URL", "https://fapi.binance.com")
     )
 
     def __post_init__(self) -> None:

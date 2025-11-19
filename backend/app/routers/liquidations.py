@@ -49,7 +49,7 @@ async def get_support_resistance(
 async def refresh_liquidations(
     service: LiquidationService = Depends(_get_liquidation_service),
 ) -> dict:
-    """Force a refresh of liquidation data from Bybit."""
+    """Force a refresh of liquidation data from Binance Futures."""
     try:
         await service.fetch_liquidations()
         return {
