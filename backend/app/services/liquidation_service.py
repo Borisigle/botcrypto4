@@ -32,7 +32,7 @@ class LiquidationService:
         self.bin_size = bin_size if bin_size > 0 else 100.0
         self.max_clusters = max(1, max_clusters)
         self.category = category
-        self.endpoint = f"{base_url.rstrip('/')}/v5/public/liquidation"
+        self.endpoint = f"{base_url.rstrip('/')}/v5/market/liquidation"
         self.http_timeout = http_timeout
 
         self.liquidations: List[dict] = []
@@ -83,11 +83,8 @@ class LiquidationService:
             self._last_updated = datetime.now(timezone.utc)
             cluster_count = len(self.clusters)
 
-        self.logger.debug(
-            "Liquidations fetched: count=%s unique_bins=%s",
-            len(normalized),
-            cluster_count,
-        )
+        self.logger.info("Liquidations fetched: %s items", len(normalized))
+        self.logger.debug("Liquidation clusters updated: unique_bins=%s", cluster_count)
 
     def _build_clusters_locked(self) -> None:
         clusters: Dict[float, ClusterBucket] = {}
