@@ -134,13 +134,17 @@ async def startup_event() -> None:
         max_clusters=settings.liquidation_max_clusters,
         category=settings.liquidation_category,
         base_url=settings.liquidation_base_url,
+        api_key=settings.liquidation_api_key,
+        api_secret=settings.liquidation_api_secret,
     )
     await liquidation_service.fetch_liquidations()
+    auth_mode = "authenticated" if (settings.liquidation_api_key and settings.liquidation_api_secret) else "unauthenticated"
     logger.info(
-        "Liquidation service initialized (symbol=%s, bin_size=%s, refresh_interval=%ss)",
+        "Liquidation service initialized (symbol=%s, bin_size=%s, refresh_interval=%ss, mode=%s)",
         liquidation_service.symbol,
         liquidation_service.bin_size,
         settings.liquidation_refresh_seconds,
+        auth_mode,
     )
 
     await ws_module.startup()

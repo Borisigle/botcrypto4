@@ -219,6 +219,12 @@ class Settings:
     liquidation_base_url: str = field(
         default_factory=lambda: os.getenv("LIQUIDATION_BASE_URL", "https://fapi.binance.com")
     )
+    liquidation_api_key: Optional[str] = field(
+        default_factory=lambda: os.getenv("LIQUIDATION_API_KEY") or os.getenv("BINANCE_API_KEY")
+    )
+    liquidation_api_secret: Optional[str] = field(
+        default_factory=lambda: os.getenv("LIQUIDATION_API_SECRET") or os.getenv("BINANCE_API_SECRET")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")

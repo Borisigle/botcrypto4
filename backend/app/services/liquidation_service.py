@@ -1,4 +1,4 @@
-"""Liquidation tracker service backed by Binance Futures public API."""
+"""Liquidation tracker service backed by Binance Futures API."""
 from __future__ import annotations
 
 import logging
@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 import httpx
 
 from app.models.indicators import LiquidationCluster, LiquidationSnapshot
+from app.utils.binance_signer import BinanceSigner
 
 ClusterBucket = Dict[str, float]
 
@@ -26,6 +27,8 @@ class LiquidationService:
         category: Optional[str] = None,
         base_url: str = "https://fapi.binance.com",
         http_timeout: float = 10.0,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
     ) -> None:
         self.symbol = symbol.upper()
         self.limit = limit
@@ -42,6 +45,11 @@ class LiquidationService:
         self.logger = logging.getLogger("liquidation_service")
         self._lock = Lock()
 
+        self.signer: Optional[BinanceSigner] = None
+        if api_key and api_secret:
+            self.signer = BinanceSigner(api_key, api_secret)
+            self.logger.info("Liquidation service initialized with authenticated API credentials")
+
     @property
     def last_updated(self) -> Optional[datetime]:
         with self._lock:
@@ -55,9 +63,14 @@ class LiquidationService:
             "limit": self.limit,
         }
 
+        headers = {}
+        if self.signer:
+            params = self.signer.sign_request(params)
+            headers["X-MBX-APIKEY"] = self.signer.api_key
+
         try:
             async with httpx.AsyncClient(timeout=self.http_timeout) as client:
-                response = await client.get(self.endpoint, params=params)
+                response = await client.get(self.endpoint, params=params, headers=headers)
                 response.raise_for_status()
         except httpx.HTTPError as exc:
             self.logger.warning("Failed to fetch Binance liquidations: %s", exc)
@@ -78,7 +91,8 @@ class LiquidationService:
             self._last_updated = datetime.now(timezone.utc)
             cluster_count = len(self.clusters)
 
-        self.logger.info("Liquidations fetched: %s items", len(normalized))
+        auth_status = "authenticated" if self.signer else "unauthenticated"
+        self.logger.info("Liquidations fetched from Binance (%s): %s items", auth_status, len(normalized))
         self.logger.debug("Liquidation clusters updated: unique_bins=%s", cluster_count)
 
     def _build_clusters_locked(self) -> None:
@@ -191,10 +205,41 @@ class LiquidationService:
 _liquidation_service: Optional[LiquidationService] = None
 
 
-def init_liquidation_service(**kwargs) -> LiquidationService:
+def init_liquidation_service(
+    *,
+    symbol: str = "BTCUSDT",
+    limit: int = 200,
+    bin_size: float = 100.0,
+    max_clusters: int = 20,
+    category: Optional[str] = None,
+    base_url: str = "https://fapi.binance.com",
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+) -> LiquidationService:
+    """Initialize the liquidation service with optional authentication.
+    
+    Args:
+        symbol: Trading symbol (e.g., BTCUSDT)
+        limit: Number of liquidations to fetch
+        bin_size: Price bin size for clustering
+        max_clusters: Maximum clusters to return
+        category: Optional liquidation category
+        base_url: Binance API base URL
+        api_key: Optional Binance API key for authenticated requests
+        api_secret: Optional Binance API secret for authenticated requests
+    """
     global _liquidation_service
     if _liquidation_service is None:
-        _liquidation_service = LiquidationService(**kwargs)
+        _liquidation_service = LiquidationService(
+            symbol=symbol,
+            limit=limit,
+            bin_size=bin_size,
+            max_clusters=max_clusters,
+            category=category,
+            base_url=base_url,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
     return _liquidation_service
 
 
