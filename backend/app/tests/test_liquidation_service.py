@@ -25,7 +25,7 @@ def test_liquidation_service_init(liquidation_service: LiquidationService) -> No
     assert liquidation_service.bin_size == 100.0
     assert liquidation_service.max_clusters == 20
     assert liquidation_service.endpoint == "https://fapi.binance.com/fapi/v1/forceOrders"
-    assert liquidation_service.liquidations == []
+    assert len(liquidation_service.liquidations) == 0
     assert liquidation_service.clusters == {}
 
 
@@ -170,11 +170,14 @@ async def test_fetch_liquidations_empty_response(liquidation_service: Liquidatio
 
 def test_build_clusters(liquidation_service: LiquidationService) -> None:
     """Test cluster building with mock liquidations."""
-    liquidation_service.liquidations = [
-        {"price": 91500.0, "qty": 10.5, "side": "sell"},
-        {"price": 91500.5, "qty": 5.2, "side": "buy"},
-        {"price": 91600.0, "qty": 8.3, "side": "sell"},
-    ]
+    liquidation_service.liquidations.clear()
+    liquidation_service.liquidations.extend(
+        [
+            {"price": 91500.0, "qty": 10.5, "side": "sell"},
+            {"price": 91500.5, "qty": 5.2, "side": "buy"},
+            {"price": 91600.0, "qty": 8.3, "side": "sell"},
+        ]
+    )
     
     liquidation_service._build_clusters_locked()
     

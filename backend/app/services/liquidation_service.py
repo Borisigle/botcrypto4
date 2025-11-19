@@ -1,13 +1,17 @@
 """Liquidation tracker service backed by Binance Futures API."""
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import deque
+from contextlib import suppress
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Dict, List, Optional
+from typing import Deque, Dict, Optional
 
 import httpx
 
+from app.connectors.liquidation_websocket import LiquidationWebSocketConnector
 from app.models.indicators import LiquidationCluster, LiquidationSnapshot
 from app.utils.binance_signer import BinanceSigner
 
@@ -29,6 +33,8 @@ class LiquidationService:
         http_timeout: float = 10.0,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
+        websocket_enabled: bool = True,
+        max_liquidations: int = 500,
     ) -> None:
         self.symbol = symbol.upper()
         self.limit = limit
@@ -37,10 +43,13 @@ class LiquidationService:
         self.category = category
         self.endpoint = f"{base_url.rstrip('/')}/fapi/v1/forceOrders"
         self.http_timeout = http_timeout
+        self.websocket_enabled = websocket_enabled
 
-        self.liquidations: List[dict] = []
+        # Use deque for efficient append and automatic size limiting
+        self.liquidations: Deque[dict] = deque(maxlen=max_liquidations)
         self.clusters: Dict[float, ClusterBucket] = {}
         self._last_updated: Optional[datetime] = None
+        self._last_cluster_build: Optional[datetime] = None
 
         self.logger = logging.getLogger("liquidation_service")
         self._lock = Lock()
@@ -49,6 +58,11 @@ class LiquidationService:
         if api_key and api_secret:
             self.signer = BinanceSigner(api_key, api_secret)
             self.logger.info("Liquidation service initialized with authenticated API credentials")
+        
+        # WebSocket connector and background tasks
+        self.ws_connector: Optional[LiquidationWebSocketConnector] = None
+        self._cluster_rebuild_task: Optional[asyncio.Task] = None
+        self._ws_task: Optional[asyncio.Task] = None
 
     @property
     def last_updated(self) -> Optional[datetime]:
@@ -86,14 +100,122 @@ class LiquidationService:
         normalized = [entry for entry in (self._normalize_liquidation(item) for item in liq_list) if entry]
 
         with self._lock:
-            self.liquidations = normalized
+            self.liquidations.clear()
+            self.liquidations.extend(normalized)
             self._build_clusters_locked()
             self._last_updated = datetime.now(timezone.utc)
+            self._last_cluster_build = self._last_updated
             cluster_count = len(self.clusters)
 
         auth_status = "authenticated" if self.signer else "unauthenticated"
         self.logger.info("Liquidations fetched from Binance (%s): %s items", auth_status, len(normalized))
         self.logger.debug("Liquidation clusters updated: unique_bins=%s", cluster_count)
+    
+    async def initialize(self, cluster_rebuild_interval: int = 5) -> None:
+        """Initialize WebSocket connector for real-time liquidations.
+        
+        Args:
+            cluster_rebuild_interval: Seconds between automatic cluster rebuilds
+        """
+        if not self.websocket_enabled:
+            self.logger.info("Liquidation WebSocket disabled, using REST API only")
+            return
+        
+        if self.ws_connector:
+            self.logger.warning("Liquidation WebSocket already initialized")
+            return
+        
+        self.ws_connector = LiquidationWebSocketConnector(
+            symbol=self.symbol.lower(),
+            on_liquidation=self._on_liquidation_received,
+        )
+        
+        # Start WebSocket in background
+        self._ws_task = asyncio.create_task(self.ws_connector.connect())
+        
+        # Start cluster rebuild task
+        self._cluster_rebuild_task = asyncio.create_task(self._cluster_rebuild_loop(cluster_rebuild_interval))
+        
+        self.logger.info(
+            "Liquidation WebSocket connector initialized (symbol=%s, cluster_rebuild_interval=%ss)",
+            self.symbol,
+            cluster_rebuild_interval,
+        )
+    
+    async def _on_liquidation_received(self, liquidation: dict) -> None:
+        """Callback when new liquidation is received from WebSocket.
+        
+        Args:
+            liquidation: Liquidation dict with keys: price, qty, side, time, symbol
+        """
+        normalized = self._normalize_liquidation(liquidation)
+        if not normalized:
+            return
+        
+        with self._lock:
+            self.liquidations.append(normalized)
+            self._last_updated = datetime.now(timezone.utc)
+            liq_count = len(self.liquidations)
+        
+        # Trigger cluster rebuild on every 10th liquidation or every few seconds
+        if liq_count % 10 == 0:
+            self._maybe_rebuild_clusters()
+    
+    def _maybe_rebuild_clusters(self) -> None:
+        """Rebuild clusters if enough time has passed since last rebuild."""
+        now = datetime.now(timezone.utc)
+        
+        # Rebuild if it's been more than 2 seconds since last rebuild
+        if self._last_cluster_build is None or \
+           (now - self._last_cluster_build).total_seconds() >= 2:
+            with self._lock:
+                self._build_clusters_locked()
+                self._last_cluster_build = now
+                cluster_count = len(self.clusters)
+                liq_count = len(self.liquidations)
+            
+            self.logger.debug("Clusters rebuilt: %s bins, %s liquidations", cluster_count, liq_count)
+    
+    async def _cluster_rebuild_loop(self, interval: int) -> None:
+        """Background task that periodically rebuilds clusters.
+        
+        Args:
+            interval: Seconds between rebuilds
+        """
+        self.logger.info("Cluster rebuild loop started (interval=%ss)", interval)
+        
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                self._maybe_rebuild_clusters()
+            except asyncio.CancelledError:
+                self.logger.info("Cluster rebuild loop cancelled")
+                break
+            except Exception as exc:
+                self.logger.exception("Error in cluster rebuild loop: %s", exc)
+    
+    async def shutdown(self) -> None:
+        """Shutdown WebSocket connector and cleanup resources."""
+        # Cancel cluster rebuild task
+        if self._cluster_rebuild_task:
+            self._cluster_rebuild_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._cluster_rebuild_task
+            self._cluster_rebuild_task = None
+            self.logger.info("Cluster rebuild task stopped")
+        
+        # Close WebSocket connector
+        if self.ws_connector:
+            await self.ws_connector.close()
+            self.ws_connector = None
+        
+        # Cancel WebSocket task
+        if self._ws_task:
+            self._ws_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._ws_task
+            self._ws_task = None
+            self.logger.info("Liquidation WebSocket connector closed")
 
     def _build_clusters_locked(self) -> None:
         clusters: Dict[float, ClusterBucket] = {}
@@ -127,19 +249,50 @@ class LiquidationService:
 
     @staticmethod
     def _normalize_liquidation(entry: dict) -> Optional[dict]:
+        if not entry:
+            return None
+
+        price_value = entry.get("price") or entry.get("p")
+        qty_value = entry.get("origQty") or entry.get("qty") or entry.get("q")
+        side_value = entry.get("side") or entry.get("S")
+
         try:
-            price = float(entry.get("price"))
-            qty = float(entry.get("origQty", entry.get("qty")))
+            price = float(price_value)
+            qty = float(qty_value)
         except (TypeError, ValueError):
             return None
 
         if qty <= 0:
             return None
 
-        side = str(entry.get("side", "")).lower()
-        if side not in {"buy", "sell"}:
+        side: Optional[str] = None
+        if isinstance(side_value, str):
+            side_upper = side_value.upper()
+            if side_upper in {"BUY", "SELL"}:
+                side = side_upper.lower()
+
+        if side is None:
             return None
-        return {"price": price, "qty": qty, "side": side}
+
+        time_value = entry.get("time") or entry.get("T")
+        timestamp: datetime
+        if isinstance(time_value, datetime):
+            timestamp = time_value if time_value.tzinfo else time_value.replace(tzinfo=timezone.utc)
+        else:
+            try:
+                timestamp = datetime.fromtimestamp(int(time_value) / 1000, tz=timezone.utc) if time_value else datetime.now(timezone.utc)
+            except (TypeError, ValueError):
+                timestamp = datetime.now(timezone.utc)
+
+        symbol_value = entry.get("symbol") or entry.get("s") or "UNKNOWN"
+
+        return {
+            "price": price,
+            "qty": qty,
+            "side": side,
+            "time": timestamp,
+            "symbol": str(symbol_value).upper(),
+        }
 
     def get_clusters(self) -> Dict[float, ClusterBucket]:
         """Return the top clusters ordered by total liquidation volume."""
@@ -215,6 +368,8 @@ def init_liquidation_service(
     base_url: str = "https://fapi.binance.com",
     api_key: Optional[str] = None,
     api_secret: Optional[str] = None,
+    websocket_enabled: bool = True,
+    max_liquidations: int = 500,
 ) -> LiquidationService:
     """Initialize the liquidation service with optional authentication.
     
@@ -227,6 +382,8 @@ def init_liquidation_service(
         base_url: Binance API base URL
         api_key: Optional Binance API key for authenticated requests
         api_secret: Optional Binance API secret for authenticated requests
+        websocket_enabled: Enable real-time WebSocket liquidation streaming
+        max_liquidations: Maximum liquidations to keep in memory
     """
     global _liquidation_service
     if _liquidation_service is None:
@@ -239,6 +396,8 @@ def init_liquidation_service(
             base_url=base_url,
             api_key=api_key,
             api_secret=api_secret,
+            websocket_enabled=websocket_enabled,
+            max_liquidations=max_liquidations,
         )
     return _liquidation_service
 

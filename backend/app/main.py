@@ -53,7 +53,6 @@ app.include_router(liquidations_router)
 ws_module = get_ws_module()
 _cvd_reset_task: Optional[asyncio.Task] = None
 _volume_delta_snapshot_task: Optional[asyncio.Task] = None
-_liquidation_refresh_task: Optional[asyncio.Task] = None
 logger = logging.getLogger("main")
 
 
@@ -93,30 +92,9 @@ async def _volume_delta_snapshot_loop() -> None:
             loop_logger.exception("Volume Delta snapshot loop encountered an error")
 
 
-def _sanitize_interval(interval: int, minimum: int = 5) -> int:
-    return max(interval, minimum)
-
-
-async def _liquidation_refresh_loop(interval: int) -> None:
-    """Background task that refreshes liquidation clusters periodically."""
-    interval = _sanitize_interval(interval, minimum=5)
-    loop_logger = logging.getLogger("liquidation_service")
-    loop_logger.info("Liquidation refresh loop started (interval=%ss)", interval)
-    while True:
-        try:
-            await asyncio.sleep(interval)
-            service = get_liquidation_service()
-            await service.fetch_liquidations()
-        except asyncio.CancelledError:
-            loop_logger.info("Liquidation refresh loop cancelled")
-            break
-        except Exception:
-            loop_logger.exception("Liquidation refresh loop encountered an error")
-
-
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _cvd_reset_task, _volume_delta_snapshot_task, _liquidation_refresh_task
+    global _cvd_reset_task, _volume_delta_snapshot_task
 
     init_cvd_service(reset_period_seconds=settings.cvd_reset_seconds)
     logger.info(
@@ -136,15 +114,27 @@ async def startup_event() -> None:
         base_url=settings.liquidation_base_url,
         api_key=settings.liquidation_api_key,
         api_secret=settings.liquidation_api_secret,
+        websocket_enabled=settings.liquidation_websocket_enabled,
+        max_liquidations=settings.liquidation_max_size,
     )
+    
+    # Initial REST API fetch for historical liquidations
     await liquidation_service.fetch_liquidations()
+    
+    # Initialize WebSocket for real-time updates
+    await liquidation_service.initialize(
+        cluster_rebuild_interval=settings.liquidation_cluster_rebuild_interval
+    )
+    
     auth_mode = "authenticated" if (settings.liquidation_api_key and settings.liquidation_api_secret) else "unauthenticated"
+    ws_mode = "websocket+rest" if settings.liquidation_websocket_enabled else "rest_only"
     logger.info(
-        "Liquidation service initialized (symbol=%s, bin_size=%s, refresh_interval=%ss, mode=%s)",
+        "Liquidation service initialized (symbol=%s, bin_size=%s, refresh_interval=%ss, mode=%s, stream=%s)",
         liquidation_service.symbol,
         liquidation_service.bin_size,
         settings.liquidation_refresh_seconds,
         auth_mode,
+        ws_mode,
     )
 
     await ws_module.startup()
@@ -155,18 +145,10 @@ async def startup_event() -> None:
     _volume_delta_snapshot_task = asyncio.create_task(_volume_delta_snapshot_loop())
     logger.info("Volume Delta snapshot background task started")
 
-    _liquidation_refresh_task = asyncio.create_task(
-        _liquidation_refresh_loop(settings.liquidation_refresh_seconds)
-    )
-    logger.info(
-        "Liquidation refresh background task started (interval=%ss)",
-        settings.liquidation_refresh_seconds,
-    )
-
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global _cvd_reset_task, _volume_delta_snapshot_task, _liquidation_refresh_task
+    global _cvd_reset_task, _volume_delta_snapshot_task
 
     if _cvd_reset_task:
         _cvd_reset_task.cancel()
@@ -182,12 +164,9 @@ async def shutdown_event() -> None:
         logger.info("Volume Delta snapshot background task stopped")
         _volume_delta_snapshot_task = None
 
-    if _liquidation_refresh_task:
-        _liquidation_refresh_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _liquidation_refresh_task
-        logger.info("Liquidation refresh background task stopped")
-        _liquidation_refresh_task = None
+    # Shutdown liquidation WebSocket
+    liquidation_service = get_liquidation_service()
+    await liquidation_service.shutdown()
 
     await ws_module.shutdown()
 

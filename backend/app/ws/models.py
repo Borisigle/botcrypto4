@@ -225,6 +225,15 @@ class Settings:
     liquidation_api_secret: Optional[str] = field(
         default_factory=lambda: os.getenv("LIQUIDATION_API_SECRET") or os.getenv("BINANCE_API_SECRET")
     )
+    liquidation_websocket_enabled: bool = field(
+        default_factory=lambda: _env_bool("LIQUIDATION_WEBSOCKET_ENABLED", "true")
+    )
+    liquidation_max_size: int = field(
+        default_factory=lambda: int(os.getenv("LIQUIDATION_MAX_SIZE", "500"))
+    )
+    liquidation_cluster_rebuild_interval: int = field(
+        default_factory=lambda: int(os.getenv("LIQUIDATION_CLUSTER_REBUILD_INTERVAL", "5"))
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
@@ -238,6 +247,10 @@ class Settings:
             self.liquidation_refresh_seconds = 30
         if self.liquidation_max_clusters <= 0:
             self.liquidation_max_clusters = 20
+        if self.liquidation_max_size <= 0:
+            self.liquidation_max_size = 500
+        if self.liquidation_cluster_rebuild_interval <= 0:
+            self.liquidation_cluster_rebuild_interval = 5
         if self.liquidation_category:
             category = self.liquidation_category.strip().lower()
             self.liquidation_category = category or None
