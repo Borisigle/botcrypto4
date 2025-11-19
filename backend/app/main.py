@@ -9,8 +9,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers.indicators import router as indicators_router
+from app.routers.liquidations import router as liquidations_router
 from app.routers.trades import router as trades_router
 from app.services.cvd_service import init_cvd_service, get_cvd_service
+from app.services.liquidation_service import (
+    get_liquidation_service,
+    init_liquidation_service,
+)
 from app.services.volume_delta_service import init_volume_delta_service, get_volume_delta_service
 from app.ws.models import get_settings
 from app.ws.routes import get_ws_module, router as ws_router
@@ -43,10 +48,12 @@ app.add_middleware(
 app.include_router(ws_router)
 app.include_router(trades_router)
 app.include_router(indicators_router)
+app.include_router(liquidations_router)
 
 ws_module = get_ws_module()
 _cvd_reset_task: Optional[asyncio.Task] = None
 _volume_delta_snapshot_task: Optional[asyncio.Task] = None
+_liquidation_refresh_task: Optional[asyncio.Task] = None
 logger = logging.getLogger("main")
 
 
@@ -86,9 +93,30 @@ async def _volume_delta_snapshot_loop() -> None:
             loop_logger.exception("Volume Delta snapshot loop encountered an error")
 
 
+def _sanitize_interval(interval: int, minimum: int = 5) -> int:
+    return max(interval, minimum)
+
+
+async def _liquidation_refresh_loop(interval: int) -> None:
+    """Background task that refreshes liquidation clusters periodically."""
+    interval = _sanitize_interval(interval, minimum=5)
+    loop_logger = logging.getLogger("liquidation_service")
+    loop_logger.info("Liquidation refresh loop started (interval=%ss)", interval)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            service = get_liquidation_service()
+            await service.fetch_liquidations()
+        except asyncio.CancelledError:
+            loop_logger.info("Liquidation refresh loop cancelled")
+            break
+        except Exception:
+            loop_logger.exception("Liquidation refresh loop encountered an error")
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _cvd_reset_task, _volume_delta_snapshot_task
+    global _cvd_reset_task, _volume_delta_snapshot_task, _liquidation_refresh_task
 
     init_cvd_service(reset_period_seconds=settings.cvd_reset_seconds)
     logger.info(
@@ -99,6 +127,22 @@ async def startup_event() -> None:
     init_volume_delta_service(period_seconds=60)
     logger.info("Volume Delta service initialized (default_period=60s)")
 
+    liquidation_service = init_liquidation_service(
+        symbol=settings.liquidation_symbol,
+        limit=settings.liquidation_limit,
+        bin_size=settings.liquidation_bin_size,
+        max_clusters=settings.liquidation_max_clusters,
+        category=settings.liquidation_category,
+        base_url=settings.liquidation_base_url,
+    )
+    await liquidation_service.fetch_liquidations()
+    logger.info(
+        "Liquidation service initialized (symbol=%s, bin_size=%s, refresh_interval=%ss)",
+        liquidation_service.symbol,
+        liquidation_service.bin_size,
+        settings.liquidation_refresh_seconds,
+    )
+
     await ws_module.startup()
 
     _cvd_reset_task = asyncio.create_task(_cvd_auto_reset_loop())
@@ -107,10 +151,18 @@ async def startup_event() -> None:
     _volume_delta_snapshot_task = asyncio.create_task(_volume_delta_snapshot_loop())
     logger.info("Volume Delta snapshot background task started")
 
+    _liquidation_refresh_task = asyncio.create_task(
+        _liquidation_refresh_loop(settings.liquidation_refresh_seconds)
+    )
+    logger.info(
+        "Liquidation refresh background task started (interval=%ss)",
+        settings.liquidation_refresh_seconds,
+    )
+
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global _cvd_reset_task, _volume_delta_snapshot_task
+    global _cvd_reset_task, _volume_delta_snapshot_task, _liquidation_refresh_task
 
     if _cvd_reset_task:
         _cvd_reset_task.cancel()
@@ -125,6 +177,13 @@ async def shutdown_event() -> None:
             await _volume_delta_snapshot_task
         logger.info("Volume Delta snapshot background task stopped")
         _volume_delta_snapshot_task = None
+
+    if _liquidation_refresh_task:
+        _liquidation_refresh_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _liquidation_refresh_task
+        logger.info("Liquidation refresh background task stopped")
+        _liquidation_refresh_task = None
 
     await ws_module.shutdown()
 

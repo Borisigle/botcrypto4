@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -31,6 +32,30 @@ class CVDSnapshot(BaseModel):
     buy_volume: float  # total buy volume since reset
     sell_volume: float  # total sell volume since reset
     volume_delta: float  # buy_volume - sell_volume (= CVD)
+    
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+
+class LiquidationCluster(BaseModel):
+    """Aggregated liquidation data for a specific price level."""
+    
+    price_level: float
+    buy_liquidations: float
+    sell_liquidations: float
+    total_liquidations: float
+    ratio: float  # buy / sell
+
+
+class LiquidationSnapshot(BaseModel):
+    """Snapshot of liquidation clusters plus support/resistance levels."""
+    
+    clusters: List[LiquidationCluster]
+    nearest_support: Optional[float]
+    nearest_resistance: Optional[float]
+    timestamp: datetime
     
     class Config:
         json_encoders = {
