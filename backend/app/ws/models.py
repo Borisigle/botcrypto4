@@ -198,10 +198,44 @@ class Settings:
     cvd_reset_seconds: int = field(
         default_factory=lambda: int(os.getenv("CVD_RESET_SECONDS", "3600"))
     )
+    liquidation_symbol: str = field(
+        default_factory=lambda: os.getenv("LIQUIDATION_SYMBOL", "BTCUSDT")
+    )
+    liquidation_limit: int = field(
+        default_factory=lambda: int(os.getenv("LIQUIDATION_LIMIT", "200"))
+    )
+    liquidation_bin_size: float = field(
+        default_factory=lambda: float(os.getenv("LIQUIDATION_BIN_SIZE", "100"))
+    )
+    liquidation_refresh_seconds: int = field(
+        default_factory=lambda: int(os.getenv("LIQUIDATION_REFRESH_SECONDS", "30"))
+    )
+    liquidation_max_clusters: int = field(
+        default_factory=lambda: int(os.getenv("LIQUIDATION_MAX_CLUSTERS", "20"))
+    )
+    liquidation_category: Optional[str] = field(
+        default_factory=lambda: os.getenv("LIQUIDATION_CATEGORY", "linear") or None
+    )
+    liquidation_base_url: str = field(
+        default_factory=lambda: os.getenv("LIQUIDATION_BASE_URL", "https://api.bybit.com")
+    )
 
     def __post_init__(self) -> None:
         base_ws_url = os.getenv("BINANCE_WS_BASE_URL", "wss://fstream.binance.com/ws")
         self.symbol = self.symbol.upper()
+        self.liquidation_symbol = self.liquidation_symbol.upper()
+        if self.liquidation_bin_size <= 0:
+            self.liquidation_bin_size = 100.0
+        if self.liquidation_limit <= 0:
+            self.liquidation_limit = 200
+        if self.liquidation_refresh_seconds <= 0:
+            self.liquidation_refresh_seconds = 30
+        if self.liquidation_max_clusters <= 0:
+            self.liquidation_max_clusters = 20
+        if self.liquidation_category:
+            category = self.liquidation_category.strip().lower()
+            self.liquidation_category = category or None
+
         interval = max(100, self.depth_interval_ms)
         if interval not in (100, 200, 250, 500, 1000):
             # Binance supports granularities of 100ms or 250ms on perps; fall back gracefully.
