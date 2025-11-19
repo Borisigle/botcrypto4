@@ -6,6 +6,22 @@ from datetime import datetime
 from pydantic import BaseModel
 
 
+class VolumeDeltaSnapshot(BaseModel):
+    """Snapshot of Volume Delta for a specific time period."""
+    
+    period: int  # seconds
+    buy_volume: float
+    sell_volume: float
+    volume_delta: float  # buy - sell
+    trade_count: int
+    timestamp: datetime
+    
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+
 class CVDSnapshot(BaseModel):
     """Snapshot of Cumulative Volume Delta at a point in time."""
     
