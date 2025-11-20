@@ -10,12 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers.indicators import router as indicators_router
 from app.routers.liquidations import router as liquidations_router
+from app.routers.signals import router as signals_router
 from app.routers.trades import router as trades_router
 from app.services.cvd_service import init_cvd_service, get_cvd_service
 from app.services.liquidation_service import (
     get_liquidation_service,
     init_liquidation_service,
 )
+from app.services.sweep_detector import init_sweep_detector, get_sweep_detector
 from app.services.volume_delta_service import init_volume_delta_service, get_volume_delta_service
 from app.ws.models import get_settings
 from app.ws.routes import get_ws_module, router as ws_router
@@ -49,10 +51,12 @@ app.include_router(ws_router)
 app.include_router(trades_router)
 app.include_router(indicators_router)
 app.include_router(liquidations_router)
+app.include_router(signals_router)
 
 ws_module = get_ws_module()
 _cvd_reset_task: Optional[asyncio.Task] = None
 _volume_delta_snapshot_task: Optional[asyncio.Task] = None
+_sweep_detector_task: Optional[asyncio.Task] = None
 logger = logging.getLogger("main")
 
 
@@ -92,9 +96,55 @@ async def _volume_delta_snapshot_loop() -> None:
             loop_logger.exception("Volume Delta snapshot loop encountered an error")
 
 
+async def _sweep_detector_loop() -> None:
+    """Background task that periodically analyzes setups for sweep signals."""
+    loop_logger = logging.getLogger("sweep_detector")
+    loop_logger.info("Sweep detector analysis loop started (interval=%ss)", 5)
+    while True:
+        try:
+            await asyncio.sleep(5)
+            sweep_detector = get_sweep_detector()
+            
+            # Get current data
+            trades = ws_module.trade_service.get_recent_trades(limit=999_999)
+            if not trades:
+                continue
+            
+            current_price = trades[-1].get("price") if trades else 0
+            if current_price <= 0:
+                continue
+            
+            # Get indicators
+            cvd_service = get_cvd_service()
+            cvd_snapshot = cvd_service.build_snapshot(trades, record_history=False)
+            cvd_snapshot_dict = cvd_snapshot.dict()
+            
+            volume_delta_service = get_volume_delta_service()
+            vol_delta_snapshot = volume_delta_service.calculate_volume_delta(trades, 60)
+            
+            # Get liquidation levels
+            liquidation_service = get_liquidation_service()
+            support = liquidation_service.get_nearest_support(current_price)
+            resistance = liquidation_service.get_nearest_resistance(current_price)
+            
+            # Analyze
+            await sweep_detector.analyze(
+                current_price=current_price,
+                cvd_snapshot=cvd_snapshot_dict,
+                vol_delta_snapshot=vol_delta_snapshot,
+                liquidation_support=support,
+                liquidation_resistance=resistance,
+            )
+        except asyncio.CancelledError:
+            loop_logger.info("Sweep detector analysis loop cancelled")
+            break
+        except Exception:
+            loop_logger.exception("Sweep detector analysis loop encountered an error")
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _cvd_reset_task, _volume_delta_snapshot_task
+    global _cvd_reset_task, _volume_delta_snapshot_task, _sweep_detector_task
 
     init_cvd_service(reset_period_seconds=settings.cvd_reset_seconds)
     logger.info(
@@ -104,6 +154,9 @@ async def startup_event() -> None:
 
     init_volume_delta_service(period_seconds=60)
     logger.info("Volume Delta service initialized (default_period=60s)")
+
+    init_sweep_detector()
+    logger.info("Sweep Detector initialized")
 
     liquidation_service = init_liquidation_service(
         symbol=settings.liquidation_symbol,
@@ -145,10 +198,13 @@ async def startup_event() -> None:
     _volume_delta_snapshot_task = asyncio.create_task(_volume_delta_snapshot_loop())
     logger.info("Volume Delta snapshot background task started")
 
+    _sweep_detector_task = asyncio.create_task(_sweep_detector_loop())
+    logger.info("Sweep Detector analysis background task started")
+
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global _cvd_reset_task, _volume_delta_snapshot_task
+    global _cvd_reset_task, _volume_delta_snapshot_task, _sweep_detector_task
 
     if _cvd_reset_task:
         _cvd_reset_task.cancel()
@@ -163,6 +219,13 @@ async def shutdown_event() -> None:
             await _volume_delta_snapshot_task
         logger.info("Volume Delta snapshot background task stopped")
         _volume_delta_snapshot_task = None
+
+    if _sweep_detector_task:
+        _sweep_detector_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sweep_detector_task
+        logger.info("Sweep Detector analysis background task stopped")
+        _sweep_detector_task = None
 
     # Shutdown liquidation WebSocket
     liquidation_service = get_liquidation_service()

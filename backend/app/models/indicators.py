@@ -7,6 +7,33 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 
+class Signal(BaseModel):
+    """Trading signal generated from confluence analysis."""
+    
+    timestamp: datetime
+    setup_type: str  # "bullish_sweep" or "bearish_sweep"
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    risk_reward: float  # TP - Entry / Entry - SL
+    confluence_score: float  # 0-100 (how strong is the setup)
+    
+    # Details
+    cvd_value: float
+    cvd_divergence: bool
+    volume_delta: float
+    volume_delta_percentile: float  # vs historical
+    liquidation_support: Optional[float] = None
+    liquidation_resistance: Optional[float] = None
+    
+    reason: str  # Explanation for entry
+    
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
+
+
 class VolumeDeltaSnapshot(BaseModel):
     """Snapshot of Volume Delta for a specific time period."""
     
