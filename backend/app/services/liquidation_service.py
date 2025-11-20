@@ -150,12 +150,21 @@ class LiquidationService:
         """
         normalized = self._normalize_liquidation(liquidation)
         if not normalized:
+            self.logger.debug("Failed to normalize liquidation: %s", liquidation)
             return
         
         with self._lock:
             self.liquidations.append(normalized)
             self._last_updated = datetime.now(timezone.utc)
             liq_count = len(self.liquidations)
+            cluster_count = len(self.clusters)
+        
+        # Log every 10 liquidations added
+        if liq_count % 10 == 0:
+            self.logger.info(
+                f"Liquidation added. Total in buffer: {liq_count}, "
+                f"Clusters: {cluster_count}"
+            )
         
         # Trigger cluster rebuild on every 10th liquidation or every few seconds
         if liq_count % 10 == 0:

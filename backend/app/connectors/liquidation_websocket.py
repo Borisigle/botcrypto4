@@ -113,11 +113,21 @@ class LiquidationWebSocketConnector:
     
     async def _listen(self) -> None:
         """Listen for incoming WebSocket messages."""
+        event_count = 0
         async for message in self._websocket:
             if self._stop_event.is_set():
                 break
             
             try:
+                event_count += 1
+                
+                # Log every 10 events received
+                if event_count % 10 == 0:
+                    self.logger.info(f"WebSocket events received: {event_count}")
+                
+                # Log raw message structure for debugging (first 200 chars)
+                self.logger.debug(f"Raw message: {message[:200]}")
+                
                 data = json.loads(message)
                 payloads = data if isinstance(data, list) else [data]
                 for payload in payloads:
@@ -173,7 +183,7 @@ class LiquidationWebSocketConnector:
             # Calculate lag
             lag_ms = (datetime.now(timezone.utc) - liquidation["time"]).total_seconds() * 1000
             
-            self.logger.debug(
+            self.logger.info(
                 "Liquidation event: price=%.2f, qty=%.4f, side=%s, lag_ms=%.1f",
                 liquidation["price"],
                 liquidation["qty"],
@@ -184,6 +194,8 @@ class LiquidationWebSocketConnector:
             # Call the callback if provided
             if self.on_liquidation:
                 await self.on_liquidation(liquidation)
+            else:
+                self.logger.warning("No callback handler for liquidation event")
         
         except (KeyError, ValueError, TypeError) as exc:
             self.logger.warning("Failed to parse liquidation order: %s, data=%s", exc, order)
